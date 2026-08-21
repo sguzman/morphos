@@ -14,51 +14,72 @@ Owns file watching, debounce/coalescing, rebuild scheduling, last-good-state beh
 
 ### File watching
 
-- [ ] Watch canonical workspace source files for external changes.
-- [ ] Debounce editor save bursts.
-- [ ] Coalesce related filesystem events into one logical reload.
-- [ ] Ignore Morphos's own writes where appropriate to avoid reload loops.
-- [ ] Detect source file replacement/rename patterns used by common editors.
+- [x] Watch canonical workspace source files for external changes.
+- [x] Debounce editor save bursts.
+- [x] Coalesce related filesystem events into one logical reload.
+- [x] Ignore Morphos's own writes where appropriate to avoid reload loops.
+- [x] Detect source file replacement/rename patterns used by common editors.
 
 ### Last-good-state behavior
 
-- [ ] Keep the last successfully parsed/evaluated scene visible when new source is invalid.
-- [ ] Surface parse/build diagnostics for the failed revision.
-- [ ] Automatically recover when the source becomes valid again.
-- [ ] Clearly distinguish source revision from last successful geometry revision.
+- [x] Keep the last successfully parsed/evaluated scene visible when new source is invalid.
+- [x] Surface parse/build diagnostics for the failed revision.
+- [x] Automatically recover when the source becomes valid again.
+- [x] Clearly distinguish source revision from last successful geometry revision.
 
 ### Reactive rebuild
 
-- [ ] Convert parsed source changes into workspace revisions.
-- [ ] Determine affected scene nodes/parameters.
-- [ ] Rebuild only invalidated geometry where the evaluator supports it.
-- [ ] Cancel or supersede stale rebuild requests when newer edits arrive.
-- [ ] Prevent an older asynchronous rebuild result from replacing a newer one.
+- [x] Convert parsed source changes into workspace revisions.
+- [x] Determine affected scene nodes/parameters.
+- [x] Rebuild only invalidated geometry where the evaluator supports it.
+- [x] Cancel or supersede stale rebuild requests when newer edits arrive.
+- [x] Prevent an older asynchronous rebuild result from replacing a newer one.
 
 ### GUI-source synchronization
 
-- [ ] Define ownership rules for simultaneous GUI and external text edits.
-- [ ] Persist GUI edits back to source through the scene/TOML layer.
-- [ ] Confirm that a GUI edit becomes observable as a normal workspace revision.
-- [ ] Avoid feedback loops between GUI writes and filesystem watching.
+- [x] Define ownership rules for simultaneous GUI and external text edits.
+- [x] Persist GUI edits back to source through the scene/TOML layer.
+- [x] Confirm that a GUI edit becomes observable as a normal workspace revision.
+- [x] Avoid feedback loops between GUI writes and filesystem watching.
 
 ### Performance targets
 
-- [ ] Measure edit-to-preview latency for a trivial scene.
-- [ ] Measure edit-to-preview latency for the benchmark scene from M03.
-- [ ] Add basic instrumentation for parse, evaluation, mesh upload, and total refresh time.
-- [ ] Document acceptable initial latency targets rather than prematurely optimizing.
+- [x] Measure edit-to-preview latency for a trivial scene.
+- [x] Measure edit-to-preview latency for the benchmark scene from M03.
+- [x] Add basic instrumentation for parse, evaluation, mesh upload, and total refresh time.
+- [x] Document acceptable initial latency targets rather than prematurely optimizing.
 
 ### Tests
 
-- [ ] Add tests for invalid-source → last-good-preview → recovery.
-- [ ] Add tests for stale rebuild suppression.
-- [ ] Add tests for write/reload-loop prevention.
-- [ ] Add tests for rapid consecutive edits.
+- [x] Add tests for invalid-source → last-good-preview → recovery.
+- [x] Add tests for stale rebuild suppression.
+- [x] Add tests for write/reload-loop prevention.
+- [x] Add tests for rapid consecutive edits.
 
 ## Completion criteria
 
 - Editing and saving TOML visibly updates the scene without restarting the app.
 - Invalid intermediate source does not blank or corrupt the last good viewport state.
 - Rapid edits converge on the newest workspace revision.
+
+## Verification Notes
+
+- `geom_app` now owns a dedicated reactive layer with source fingerprints, source revisions,
+  build generations, transient workspace-session IDs, a 75 ms debounce/coalescing boundary, a
+  watched `source/` directory, and a dedicated build worker that preserves one
+  `GeometryEvaluator<BoolmeshBackend>` cache per session.
+- In-app parameter nudges persist back through `SceneSource`, `geom_workspace`, disk, and the
+  same generation-tagged reactive rebuild path used by watcher-triggered external edits.
+- Last-good geometry remains visible across invalid source revisions and later valid revisions
+  recover automatically.
+- Deterministic tests cover invalid-to-recovery, stale generation suppression, own-write echo
+  suppression, semantic no-op edits, rapid consecutive edits, programmatic edits, and stale
+  session results after reopen.
+- Timing measurements were captured on Friday, August 21, 2026 with
+  `cargo test -p geom_app reactive_timing_harness -- --ignored --nocapture`:
+  smoke workspace `parse 1.01 ms`, `evaluation 56.31 ms`, `mesh 0.16 ms`, `total 64.44 ms`;
+  benchmark workspace `parse 1.64 ms`, `evaluation 66.05 ms`, `mesh 0.14 ms`, `total 72.29 ms`.
+- The coding-agent environment launched the shell successfully on Friday, August 21, 2026, but
+  did not claim visual inspection of the live desktop window. Interactive viewport confirmation
+  remains a manual local follow-up.
 

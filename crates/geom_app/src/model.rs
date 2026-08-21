@@ -1,10 +1,14 @@
+use crate::reactive::{
+    BuildAcceptance, BuildGeneration, BuildOutcome, BuildOutcomeKind, BuildRequestSnapshot,
+    DiagnosticStage, EditOrigin, ReactiveBuildSuccess, ReactiveBuildTimings, ReactiveController,
+    ReactiveDiagnostic, ReactiveStatusSnapshot, SourceFingerprint, SourceRevision,
+};
 use crate::viewport::DisplayGeometryRevision;
 use bevy::prelude::Resource;
-use geom_geometry::{
-    BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh as MorphosMesh,
-};
-use geom_scene::{NodeId, SceneDocument, parse_scene};
+use geom_geometry::Bounds;
+use geom_scene::{NodeId, ParamId, SceneDocument, SceneSource};
 use geom_workspace::{Revision, Workspace, WorkspaceError, WorkspaceSummary};
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,11 +16,10 @@ use std::time::Instant;
 pub struct AppModel {
     workspace_path: Option<PathBuf>,
     workspace: Option<Workspace>,
-    latest_scene: Option<SceneDocument>,
-    evaluator: GeometryEvaluator<BoolmeshBackend>,
+    last_good_scene: Option<SceneDocument>,
     displayed_geometry: Option<DisplayedGeometry>,
     build_status: AppBuildStatus,
-    last_rebuild_millis: Option<f64>,
+    reactive: ReactiveController,
 }
 
 impl AppModel {
@@ -24,11 +27,10 @@ impl AppModel {
         Self {
             workspace_path,
             workspace: None,
-            latest_scene: None,
-            evaluator: GeometryEvaluator::new(BoolmeshBackend::new()),
+            last_good_scene: None,
             displayed_geometry: None,
             build_status: AppBuildStatus::NoWorkspace,
-            last_rebuild_millis: None,
+            reactive: ReactiveController::new(),
         }
     }
 
@@ -48,69 +50,202 @@ impl AppModel {
         self.workspace.as_mut()
     }
 
-    pub fn process_build_request(&mut self, request: BuildRequest) -> AppRebuildAction {
-        let started = Instant::now();
-        let result = match request.action {
-            AppRebuildActionKind::Reopen => self.open_workspace_from_path(),
-            AppRebuildActionKind::Rebuild => self.reload_or_open_workspace(),
-        };
-
-        let rebuild_millis = started.elapsed().as_secs_f64() * 1_000.0;
-        self.last_rebuild_millis = Some(rebuild_millis);
-
-        if let Err(error) = result {
-            self.latest_scene = None;
-            self.build_status = match error {
-                WorkspaceBuildError::NoWorkspacePath => AppBuildStatus::NoWorkspace,
-                WorkspaceBuildError::Workspace(error) => {
-                    AppBuildStatus::WorkspaceError(error.to_string())
-                }
-            };
-            return AppRebuildAction::none();
-        }
-
-        let Some(workspace) = self.workspace.as_ref() else {
-            self.latest_scene = None;
-            self.build_status = AppBuildStatus::NoWorkspace;
-            return AppRebuildAction::none();
-        };
-
-        let scene = match parse_scene(workspace.source_text()) {
-            Ok(scene) => scene,
-            Err(error) => {
-                self.latest_scene = None;
-                self.build_status = AppBuildStatus::SceneError(error.to_string());
-                return AppRebuildAction::none();
-            }
-        };
-
-        let geometry = match self.evaluator.evaluate_root(&scene) {
-            Ok(geometry) => geometry,
-            Err(error) => {
-                self.latest_scene = Some(scene);
-                self.build_status = AppBuildStatus::GeometryError(error.to_string());
-                return AppRebuildAction::none();
-            }
-        };
-
-        self.latest_scene = Some(scene);
-        let success = BuildSuccess {
-            workspace_summary: Some(workspace.summary()),
-            requested_output: geometry.requested_output.clone(),
-            geometry: DisplayedGeometry::from_evaluated(geometry),
-            rebuild_millis,
-        };
-        self.accept_success(success.clone());
-        AppRebuildAction::accepted(success.geometry)
+    pub fn reactive_status_snapshot(&self) -> ReactiveStatusSnapshot {
+        self.reactive.status_snapshot()
     }
 
-    pub fn frame_selected_bounds(&mut self, selection: &ViewportSelection) -> Option<Bounds> {
+    pub fn current_source_revision(&self) -> SourceRevision {
+        self.reactive.current_source_revision()
+    }
+
+    pub fn prepare_reopen(
+        &mut self,
+        now: Instant,
+    ) -> Result<BuildRequestSnapshot, WorkspaceBuildError> {
+        self.open_workspace_from_path()?;
+        let workspace = self.workspace.as_ref().expect("workspace opened");
+        self.last_good_scene = None;
+        self.displayed_geometry = None;
+        self.build_status = AppBuildStatus::NoWorkspace;
+        Ok(self
+            .reactive
+            .begin_session(workspace.source_text(), EditOrigin::StartupReopen, now))
+    }
+
+    pub fn schedule_manual_rebuild(
+        &mut self,
+        now: Instant,
+    ) -> Result<BuildRequestSnapshot, WorkspaceBuildError> {
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(WorkspaceBuildError::NoWorkspacePath);
+        };
+
+        let changed = workspace
+            .reload_source()
+            .map_err(WorkspaceBuildError::Workspace)?;
+        if changed
+            && let Some(snapshot) = self.reactive.accept_external_source_reload(
+                workspace.source_text(),
+                EditOrigin::ManualReload,
+                now,
+            )
+        {
+            return Ok(snapshot);
+        }
+
+        Ok(self.reactive.note_manual_rebuild(
+            workspace.source_text(),
+            EditOrigin::ManualReload,
+            now,
+        ))
+    }
+
+    pub fn note_file_event(&mut self, observed_at: Instant) {
+        self.reactive.observe_file_event(observed_at);
+    }
+
+    pub fn drain_ready_file_event(&mut self, now: Instant) -> Option<usize> {
+        self.reactive.drain_ready_file_event(now)
+    }
+
+    pub fn accept_external_reload(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, WorkspaceBuildError> {
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Ok(None);
+        };
+
+        let changed = workspace
+            .reload_source()
+            .map_err(WorkspaceBuildError::Workspace)?;
+        if !changed {
+            let _ = self
+                .reactive
+                .clear_own_write_if_matches_current_source(workspace.source_text());
+            return Ok(None);
+        }
+
+        Ok(self.reactive.accept_external_source_reload(
+            workspace.source_text(),
+            EditOrigin::ExternalFile,
+            now,
+        ))
+    }
+
+    pub fn apply_parameter_scalar_delta(
+        &mut self,
+        parameter: &ParamId,
+        delta: f64,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        let base_fingerprint = self
+            .reactive
+            .current_source_fingerprint()
+            .ok_or_else(|| AppEditError::Conflict("no current source fingerprint".to_owned()))?;
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+
+        let disk_source =
+            fs::read_to_string(workspace.paths().source_file()).map_err(|source| {
+                AppEditError::Workspace(WorkspaceError::Io {
+                    path: workspace.paths().source_file(),
+                    operation: "read current source for conflict check",
+                    source,
+                })
+            })?;
+        if SourceFingerprint::from_text(&disk_source) != base_fingerprint {
+            let message =
+                "external source changed since the GUI edit base; retry against the newest source"
+                    .to_owned();
+            self.build_status = AppBuildStatus::Conflict(message.clone());
+            return Err(AppEditError::Conflict(message));
+        }
+
+        let current_value = self
+            .last_good_scene
+            .as_ref()
+            .and_then(|scene| scene.parameters().get(parameter))
+            .map(|parameter_definition| parameter_definition.scalar_value())
+            .ok_or_else(|| {
+                AppEditError::Conflict("parameter is unavailable for editing".to_owned())
+            })?;
+
+        let mut source =
+            SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
+        source
+            .set_parameter_scalar(parameter, current_value + delta)
+            .map_err(AppEditError::Scene)?;
+        let updated_text = source.into_text();
+        if !workspace.replace_source(updated_text.clone()) {
+            return Ok(None);
+        }
+        workspace.save().map_err(AppEditError::Workspace)?;
+        Ok(Some(self.reactive.accept_internal_source_write(
+            &updated_text,
+            origin,
+            now,
+        )))
+    }
+
+    pub fn parameter_scalar(&self, parameter: &str) -> Option<f64> {
+        let parameter = ParamId::new(parameter).ok()?;
+        self.last_good_scene
+            .as_ref()
+            .and_then(|scene| scene.parameters().get(&parameter))
+            .map(|definition| definition.scalar_value())
+    }
+
+    pub fn frame_selected_bounds(&self, selection: &ViewportSelection) -> Option<Bounds> {
+        let displayed = self.displayed_geometry.as_ref()?;
         let selected = selection.selected_node.as_ref()?;
-        let scene = self.latest_scene.as_ref()?;
-        self.evaluator
-            .evaluate_node(scene, selected)
-            .ok()
-            .map(|geometry| geometry.bounds)
+        if selected == &displayed.requested_output {
+            Some(displayed.bounds.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn accept_build_outcome(&mut self, outcome: BuildOutcome) -> BuildApplicationAction {
+        match self.reactive.accept_build_outcome(outcome) {
+            BuildAcceptance::IgnoredStale => BuildApplicationAction::none(),
+            BuildAcceptance::Accepted(outcome) => match outcome.kind {
+                BuildOutcomeKind::Success(success) => self.accept_success(
+                    outcome.source_revision,
+                    outcome.generation,
+                    outcome.requested_at,
+                    *success,
+                ),
+                BuildOutcomeKind::Failure {
+                    stage,
+                    message,
+                    timings,
+                } => {
+                    self.accept_failure(
+                        stage,
+                        message,
+                        outcome.source_revision,
+                        outcome.generation,
+                        timings,
+                    );
+                    BuildApplicationAction::none()
+                }
+            },
+        }
+    }
+
+    pub fn note_mesh_upload_complete(&mut self, upload_millis: f64, total_millis: f64) {
+        self.reactive
+            .note_mesh_upload_complete(upload_millis, total_millis);
+        if let AppBuildStatus::Success(success) = &mut self.build_status {
+            success.timings.mesh_upload_millis = upload_millis;
+            success.timings.total_millis = total_millis;
+        }
     }
 
     pub fn ui_status_snapshot(
@@ -119,6 +254,7 @@ impl AppModel {
         selection: &ViewportSelection,
     ) -> UiStatusSnapshot {
         let workspace_summary = self.workspace_summary();
+        let reactive = self.reactive.status_snapshot();
         let current_output = self
             .displayed_geometry
             .as_ref()
@@ -136,18 +272,23 @@ impl AppModel {
                 "Workspace error".to_owned(),
                 Some(message.clone()),
             ),
-            AppBuildStatus::SceneError(message) => (
+            AppBuildStatus::Conflict(message) => (
+                BuildStatusKind::Conflict,
+                "Edit conflict".to_owned(),
+                Some(message.clone()),
+            ),
+            AppBuildStatus::SceneError(diagnostic) => (
                 BuildStatusKind::SceneError,
                 "Scene error".to_owned(),
-                Some(message.clone()),
+                Some(diagnostic.message.clone()),
             ),
-            AppBuildStatus::GeometryError(message) => (
+            AppBuildStatus::GeometryError(diagnostic) => (
                 BuildStatusKind::GeometryError,
                 "Geometry error".to_owned(),
-                Some(message.clone()),
+                Some(diagnostic.message.clone()),
             ),
             AppBuildStatus::Success(success) => {
-                let kind = if success.geometry.mesh.is_empty() {
+                let kind = if success.displayed_geometry_revision == DisplayGeometryRevision::ZERO {
                     BuildStatusKind::EmptyMesh
                 } else {
                     BuildStatusKind::Success
@@ -169,19 +310,92 @@ impl AppModel {
                 .as_ref()
                 .map(WorkspaceSummary::is_dirty)
                 .unwrap_or(false),
+            source_revision: reactive.source_revision,
             geometry_revision,
+            build_generation: reactive.newest_generation,
+            last_successful_generation: reactive.last_successful_generation,
+            current_error_generation: reactive.current_error_generation,
+            watching: reactive.watching,
+            build_in_progress: reactive.build_in_progress,
             build_kind,
             build_label,
             error_message,
-            last_rebuild_millis: self.last_rebuild_millis,
+            timings: reactive.timings,
             current_output,
             selection: selection_label,
         }
     }
 
-    pub fn accept_success(&mut self, success: BuildSuccess) {
-        self.displayed_geometry = Some(success.geometry.clone());
-        self.build_status = AppBuildStatus::Success(Box::new(success));
+    fn accept_success(
+        &mut self,
+        source_revision: SourceRevision,
+        generation: BuildGeneration,
+        requested_at: Instant,
+        success: ReactiveBuildSuccess,
+    ) -> BuildApplicationAction {
+        self.last_good_scene = Some(success.scene.clone());
+        let mut refresh_displayed_geometry = false;
+        let displayed_geometry_revision = if let Some(geometry) = success.geometry.clone() {
+            let geometry_revision = DisplayGeometryRevision::new(geometry.geometry_revision);
+            self.displayed_geometry = Some(geometry);
+            refresh_displayed_geometry = true;
+            geometry_revision
+        } else {
+            self.displayed_geometry
+                .as_ref()
+                .map(|geometry| DisplayGeometryRevision::new(geometry.geometry_revision))
+                .unwrap_or(DisplayGeometryRevision::ZERO)
+        };
+
+        let requested_output = self
+            .displayed_geometry
+            .as_ref()
+            .map(|geometry| geometry.requested_output.clone());
+
+        self.build_status = AppBuildStatus::Success(Box::new(BuildSuccess {
+            workspace_summary: self.workspace_summary(),
+            source_revision,
+            generation,
+            requested_output,
+            semantic_scene_changed: success.semantic_scene_changed,
+            changed_node_ids: success.changed_node_ids,
+            changed_parameter_ids: success.changed_parameter_ids,
+            displayed_geometry_revision,
+            timings: success.timings,
+        }));
+
+        if refresh_displayed_geometry {
+            BuildApplicationAction {
+                refresh_displayed_geometry: true,
+                requested_at: Some(requested_at),
+            }
+        } else {
+            BuildApplicationAction::none()
+        }
+    }
+
+    fn accept_failure(
+        &mut self,
+        stage: DiagnosticStage,
+        message: String,
+        source_revision: SourceRevision,
+        generation: BuildGeneration,
+        _timings: ReactiveBuildTimings,
+    ) {
+        let diagnostic = Box::new(ReactiveDiagnostic {
+            stage,
+            source_revision,
+            generation,
+            message,
+        });
+        self.build_status = match stage {
+            DiagnosticStage::Workspace => {
+                AppBuildStatus::WorkspaceError(diagnostic.message.clone())
+            }
+            DiagnosticStage::Conflict => AppBuildStatus::Conflict(diagnostic.message.clone()),
+            DiagnosticStage::Scene => AppBuildStatus::SceneError(diagnostic),
+            DiagnosticStage::Geometry => AppBuildStatus::GeometryError(diagnostic),
+        };
     }
 
     fn open_workspace_from_path(&mut self) -> Result<(), WorkspaceBuildError> {
@@ -193,45 +407,41 @@ impl AppModel {
         self.workspace = Some(workspace);
         Ok(())
     }
-
-    fn reload_or_open_workspace(&mut self) -> Result<(), WorkspaceBuildError> {
-        if let Some(workspace) = self.workspace.as_mut() {
-            workspace
-                .reload_source()
-                .map_err(WorkspaceBuildError::Workspace)?;
-            return Ok(());
-        }
-        self.open_workspace_from_path()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppBuildStatus {
     NoWorkspace,
     WorkspaceError(String),
-    SceneError(String),
-    GeometryError(String),
+    Conflict(String),
+    SceneError(Box<ReactiveDiagnostic>),
+    GeometryError(Box<ReactiveDiagnostic>),
     Success(Box<BuildSuccess>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuildSuccess {
     pub workspace_summary: Option<WorkspaceSummary>,
-    pub requested_output: NodeId,
-    pub geometry: DisplayedGeometry,
-    pub rebuild_millis: f64,
+    pub source_revision: SourceRevision,
+    pub generation: BuildGeneration,
+    pub requested_output: Option<NodeId>,
+    pub semantic_scene_changed: bool,
+    pub changed_node_ids: Vec<NodeId>,
+    pub changed_parameter_ids: Vec<ParamId>,
+    pub displayed_geometry_revision: DisplayGeometryRevision,
+    pub timings: ReactiveBuildTimings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayedGeometry {
     pub requested_output: NodeId,
     pub geometry_revision: u64,
-    pub mesh: MorphosMesh,
+    pub mesh: geom_geometry::Mesh,
     pub bounds: Bounds,
 }
 
 impl DisplayedGeometry {
-    pub fn from_evaluated(geometry: EvaluatedGeometry) -> Self {
+    pub fn from_evaluated(geometry: geom_geometry::EvaluatedGeometry) -> Self {
         Self {
             requested_output: geometry.requested_output,
             geometry_revision: geometry.evaluation_revision,
@@ -277,33 +487,11 @@ pub enum AppRebuildActionKind {
     Reopen,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AppRebuildAction {
-    accepted_geometry: Option<DisplayedGeometry>,
-}
-
-impl AppRebuildAction {
-    pub fn none() -> Self {
-        Self {
-            accepted_geometry: None,
-        }
-    }
-
-    pub fn accepted(geometry: DisplayedGeometry) -> Self {
-        Self {
-            accepted_geometry: Some(geometry),
-        }
-    }
-
-    pub fn accepted_geometry(&self) -> Option<&DisplayedGeometry> {
-        self.accepted_geometry.as_ref()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStatusKind {
     NoWorkspace,
     WorkspaceError,
+    Conflict,
     SceneError,
     GeometryError,
     EmptyMesh,
@@ -316,17 +504,53 @@ pub struct UiStatusSnapshot {
     pub workspace_path: Option<PathBuf>,
     pub workspace_revision: Revision,
     pub workspace_dirty: bool,
+    pub source_revision: SourceRevision,
     pub geometry_revision: DisplayGeometryRevision,
+    pub build_generation: BuildGeneration,
+    pub last_successful_generation: Option<BuildGeneration>,
+    pub current_error_generation: Option<BuildGeneration>,
+    pub watching: bool,
+    pub build_in_progress: bool,
     pub build_kind: BuildStatusKind,
     pub build_label: String,
     pub error_message: Option<String>,
-    pub last_rebuild_millis: Option<f64>,
+    pub timings: Option<ReactiveBuildTimings>,
     pub current_output: Option<String>,
     pub selection: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuildApplicationAction {
+    refresh_displayed_geometry: bool,
+    requested_at: Option<Instant>,
+}
+
+impl BuildApplicationAction {
+    pub fn none() -> Self {
+        Self {
+            refresh_displayed_geometry: false,
+            requested_at: None,
+        }
+    }
+
+    pub fn refresh_displayed_geometry(&self) -> bool {
+        self.refresh_displayed_geometry
+    }
+
+    pub fn requested_at(&self) -> Option<Instant> {
+        self.requested_at
+    }
+}
+
 #[derive(Debug)]
-enum WorkspaceBuildError {
+pub enum AppEditError {
+    Workspace(WorkspaceError),
+    Scene(geom_scene::SceneError),
+    Conflict(String),
+}
+
+#[derive(Debug)]
+pub enum WorkspaceBuildError {
     NoWorkspacePath,
     Workspace(WorkspaceError),
 }

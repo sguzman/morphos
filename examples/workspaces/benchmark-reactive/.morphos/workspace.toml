@@ -1,0 +1,4 @@
+format_version = 1
+workspace_id = "0af2f9db-d851-4fe7-bb3d-ae2a06306508"
+name = "Reactive Benchmark"
+description = "Workspace fixture for M05 reactive timing measurements"

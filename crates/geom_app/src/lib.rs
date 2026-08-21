@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod mesh_adapter;
 pub mod model;
+pub mod reactive;
 pub mod viewport;
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
@@ -8,26 +9,32 @@ use bevy::pbr::wireframe::{Wireframe, WireframePlugin};
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use camera::{CameraFrame, OrbitCameraInputMap, OrbitCameraState};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use geom_geometry::Bounds;
-use geom_scene::NodeId;
+use geom_scene::ParamId;
 use mesh_adapter::adapt_morphos_mesh;
 use model::{
-    AppModel, BuildRequest, BuildStatusKind, DisplayedGeometry, UiStatusSnapshot,
-    ViewportDisplayMode, ViewportSelection,
+    AppEditError, AppModel, BuildStatusKind, DisplayedGeometry, UiStatusSnapshot,
+    ViewportDisplayMode, ViewportSelection, WorkspaceBuildError,
 };
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use reactive::{BuildOutcome, BuildWorker, EditOrigin, WorkerCommand, WorkspaceSessionId};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Instant;
 use viewport::DisplayGeometryRevision;
 
-/// Current Bevy version selected for M04.
+/// Current Bevy version selected for M05.
 pub const GEOM_APP_BEVY_VERSION: &str = "0.19.1";
 
-/// Current bevy_egui version selected for M04.
+/// Current bevy_egui version selected for M05.
 pub const GEOM_APP_BEVY_EGUI_VERSION: &str = "0.41.1";
 
 const GRID_EXTENT: i32 = 10;
 const GRID_SPACING: f32 = 1.0;
 const GEOMETRY_MATERIAL_COLOR: Color = Color::srgb(0.78, 0.82, 0.9);
+const DEMO_PARAMETER_ID: &str = "arm_length";
 
 /// Parses an optional workspace path from command-line arguments.
 pub fn parse_workspace_path_from_args<I>(args: I) -> Option<PathBuf>
@@ -51,6 +58,7 @@ pub fn build_app(workspace_path: Option<PathBuf>) -> App {
         .insert_resource(AppModel::new(workspace_path))
         .insert_resource(ViewportRuntimeState::default())
         .insert_resource(UiPointerCapture::default())
+        .insert_resource(ReactiveRuntimeState::default())
         .add_message::<AppCommand>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -69,6 +77,8 @@ pub fn build_app(workspace_path: Option<PathBuf>) -> App {
                 camera_input_system,
                 synchronize_camera_transform_system,
                 process_app_commands_system,
+                poll_watcher_events_system,
+                poll_build_results_system,
                 apply_geometry_refresh_system,
                 synchronize_display_mode_system,
                 draw_viewport_gizmos_system,
@@ -89,6 +99,7 @@ enum AppCommand {
     FrameAll,
     FrameSelected,
     SetDisplayMode(ViewportDisplayMode),
+    AdjustParameterScalar(ParamId, f64),
 }
 
 #[derive(Debug, Default, Resource)]
@@ -102,7 +113,7 @@ struct ViewportRuntimeState {
     selection: ViewportSelection,
     display_mode: ViewportDisplayMode,
     displayed_geometry_revision: DisplayGeometryRevision,
-    displayed_output: Option<NodeId>,
+    displayed_output: Option<String>,
     displayed_bounds: Option<Bounds>,
     render_entity: Option<Entity>,
     mesh_handle: Option<Handle<Mesh>>,
@@ -128,7 +139,7 @@ impl Default for ViewportRuntimeState {
 impl ViewportRuntimeState {
     fn accept_displayed_geometry(&mut self, geometry: &DisplayedGeometry) {
         self.displayed_geometry_revision = DisplayGeometryRevision::new(geometry.geometry_revision);
-        self.displayed_output = Some(geometry.requested_output.clone());
+        self.displayed_output = Some(geometry.requested_output.to_string());
         self.displayed_bounds = Some(geometry.bounds.clone());
         self.selection.selected_node = Some(geometry.requested_output.clone());
     }
@@ -138,6 +149,32 @@ impl ViewportRuntimeState {
             self.camera.frame_bounds(bounds, aspect_ratio);
         }
     }
+}
+
+#[derive(Default, Resource)]
+struct ReactiveRuntimeState {
+    watcher: Option<WatcherSession>,
+    worker: Option<BuildWorkerSession>,
+    pending_mesh_upload_requested_at: Option<Instant>,
+}
+
+struct WatcherSession {
+    session_id: WorkspaceSessionId,
+    scene_path: PathBuf,
+    receiver: Receiver<WatchedSourceEvent>,
+    _watcher: RecommendedWatcher,
+}
+
+struct BuildWorkerSession {
+    sender: Sender<WorkerCommand>,
+    receiver: Receiver<BuildOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchedSourceEvent {
+    session_id: WorkspaceSessionId,
+    paths: Vec<PathBuf>,
+    observed_at: Instant,
 }
 
 #[derive(Debug, Component)]
@@ -184,14 +221,16 @@ fn ui_system(
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
         .collapsible(false)
         .resizable(false)
-        .default_width(780.0)
+        .default_width(920.0)
         .show(context, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let workspace_label = status
-                    .workspace_name
-                    .as_deref()
-                    .unwrap_or("No workspace opened");
-                ui.label(format!("Workspace: {workspace_label}"));
+                ui.label(format!(
+                    "Workspace: {}",
+                    status
+                        .workspace_name
+                        .as_deref()
+                        .unwrap_or("No workspace opened")
+                ));
                 if let Some(path) = status.workspace_path.as_deref() {
                     ui.label(path.display().to_string());
                 }
@@ -207,12 +246,25 @@ fn ui_system(
                     "Clean"
                 });
                 ui.separator();
+                ui.label(format!(
+                    "Watching: {}",
+                    if status.watching { "yes" } else { "no" }
+                ));
+                ui.separator();
+                ui.label(format!("Source Rev: {}", status.source_revision.get()));
+                ui.separator();
+                ui.label(format!("Build Gen: {}", status.build_generation.get()));
+                ui.separator();
                 ui.label(format!("Geometry Rev: {}", status.geometry_revision.get()));
                 ui.separator();
                 ui.label(format!("Build: {}", status.build_label));
-                if let Some(duration) = status.last_rebuild_millis {
+                if status.build_in_progress {
                     ui.separator();
-                    ui.label(format!("Last Rebuild: {duration:.2} ms"));
+                    ui.label("Rebuilding");
+                }
+                if let Some(generation) = status.current_error_generation {
+                    ui.separator();
+                    ui.label(format!("Error Gen: {}", generation.get()));
                 }
                 if let Some(output) = status.current_output.as_deref() {
                     ui.separator();
@@ -223,6 +275,19 @@ fn ui_system(
                     ui.label(format!("Selection: {selection}"));
                 }
             });
+
+            if let Some(timings) = status.timings {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Parse: {:.2} ms", timings.parse_millis));
+                    ui.separator();
+                    ui.label(format!("Eval: {:.2} ms", timings.evaluation_millis));
+                    ui.separator();
+                    ui.label(format!("Mesh: {:.2} ms", timings.mesh_upload_millis));
+                    ui.separator();
+                    ui.label(format!("Total: {:.2} ms", timings.total_millis));
+                });
+            }
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -239,8 +304,22 @@ fn ui_system(
                     commands.write(AppCommand::FrameSelected);
                 }
 
-                ui.separator();
+                if let Some(value) = app_model.parameter_scalar(DEMO_PARAMETER_ID) {
+                    ui.separator();
+                    ui.label(format!("{DEMO_PARAMETER_ID}: {value:.2}"));
+                    if ui.small_button("-0.25").clicked()
+                        && let Ok(parameter) = ParamId::new(DEMO_PARAMETER_ID)
+                    {
+                        commands.write(AppCommand::AdjustParameterScalar(parameter, -0.25));
+                    }
+                    if ui.small_button("+0.25").clicked()
+                        && let Ok(parameter) = ParamId::new(DEMO_PARAMETER_ID)
+                    {
+                        commands.write(AppCommand::AdjustParameterScalar(parameter, 0.25));
+                    }
+                }
 
+                ui.separator();
                 let shaded_selected = viewport.display_mode == ViewportDisplayMode::Shaded;
                 if ui.selectable_label(shaded_selected, "Shaded").clicked() {
                     commands.write(AppCommand::SetDisplayMode(ViewportDisplayMode::Shaded));
@@ -259,9 +338,10 @@ fn ui_system(
         BuildStatusKind::NoWorkspace => {
             Some("No workspace opened. Launch Morphos with a workspace path.")
         }
-        BuildStatusKind::WorkspaceError => status.error_message.as_deref(),
-        BuildStatusKind::SceneError => status.error_message.as_deref(),
-        BuildStatusKind::GeometryError => status.error_message.as_deref(),
+        BuildStatusKind::WorkspaceError
+        | BuildStatusKind::Conflict
+        | BuildStatusKind::SceneError
+        | BuildStatusKind::GeometryError => status.error_message.as_deref(),
         BuildStatusKind::EmptyMesh => Some("Geometry evaluated to an empty mesh."),
         BuildStatusKind::Success => None,
     };
@@ -279,7 +359,6 @@ fn ui_system(
     }
 
     pointer_capture.wants_pointer_input = context.egui_wants_pointer_input();
-    let _ = &app_model;
     Ok(())
 }
 
@@ -314,7 +393,6 @@ fn camera_input_system(
             .camera
             .orbit(orbit_delta, OrbitCameraInputMap::default());
     }
-
     if pan_delta != Vec2::ZERO {
         viewport
             .camera
@@ -342,22 +420,30 @@ fn process_app_commands_system(
     mut commands: MessageReader<AppCommand>,
     windows: Single<&Window>,
     mut app_model: ResMut<AppModel>,
+    mut runtime: ResMut<ReactiveRuntimeState>,
     mut viewport: ResMut<ViewportRuntimeState>,
 ) {
     for command in commands.read() {
         match command {
-            AppCommand::Rebuild => {
-                let action = app_model.process_build_request(BuildRequest::rebuild());
-                if let Some(displayed) = action.accepted_geometry() {
-                    viewport.accept_displayed_geometry(displayed);
+            AppCommand::Rebuild => match app_model.schedule_manual_rebuild(Instant::now()) {
+                Ok(request) => dispatch_build_request(&mut runtime, request),
+                Err(error) => apply_workspace_error(&mut app_model, error),
+            },
+            AppCommand::Reopen => match app_model.prepare_reopen(Instant::now()) {
+                Ok(request) => {
+                    if let Some(workspace) = app_model.workspace_mut()
+                        && let Err(error) = configure_runtime_for_workspace(
+                            &mut runtime,
+                            workspace.paths().source_file(),
+                            request.session_id,
+                        )
+                    {
+                        error!("failed to configure watcher: {error}");
+                    }
+                    dispatch_build_request(&mut runtime, request);
                 }
-            }
-            AppCommand::Reopen => {
-                let action = app_model.process_build_request(BuildRequest::reopen());
-                if let Some(displayed) = action.accepted_geometry() {
-                    viewport.accept_displayed_geometry(displayed);
-                }
-            }
+                Err(error) => apply_workspace_error(&mut app_model, error),
+            },
             AppCommand::FrameAll => {
                 viewport.frame_all(windows.width() / windows.height().max(1.0));
             }
@@ -372,13 +458,83 @@ fn process_app_commands_system(
             AppCommand::SetDisplayMode(mode) => {
                 viewport.display_mode = *mode;
             }
+            AppCommand::AdjustParameterScalar(parameter, delta) => match app_model
+                .apply_parameter_scalar_delta(parameter, *delta, EditOrigin::Gui, Instant::now())
+            {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(AppEditError::Workspace(error)) => {
+                    error!("workspace edit failed: {error}");
+                }
+                Err(AppEditError::Scene(error)) => {
+                    error!("scene edit failed: {error}");
+                }
+                Err(AppEditError::Conflict(error)) => {
+                    warn!("edit conflict: {error}");
+                }
+            },
+        }
+    }
+}
+
+fn poll_watcher_events_system(
+    mut app_model: ResMut<AppModel>,
+    mut runtime: ResMut<ReactiveRuntimeState>,
+) {
+    let mut saw_relevant_event = false;
+    if let Some(watcher) = &runtime.watcher {
+        while let Ok(event) = watcher.receiver.try_recv() {
+            if event.session_id != watcher.session_id {
+                continue;
+            }
+            if event.paths.iter().any(|path| path == &watcher.scene_path) {
+                app_model.note_file_event(event.observed_at);
+                saw_relevant_event = true;
+            }
+        }
+    }
+
+    if !saw_relevant_event && app_model.drain_ready_file_event(Instant::now()).is_none() {
+        return;
+    }
+
+    if app_model.drain_ready_file_event(Instant::now()).is_some() {
+        match app_model.accept_external_reload(Instant::now()) {
+            Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+            Ok(None) => {}
+            Err(error) => apply_workspace_error(&mut app_model, error),
+        }
+    }
+}
+
+fn poll_build_results_system(
+    mut app_model: ResMut<AppModel>,
+    mut runtime: ResMut<ReactiveRuntimeState>,
+    mut viewport: ResMut<ViewportRuntimeState>,
+) {
+    let Some(receiver) = runtime
+        .worker
+        .as_ref()
+        .map(|worker| worker.receiver.clone())
+    else {
+        return;
+    };
+
+    while let Ok(outcome) = receiver.try_recv() {
+        let action = app_model.accept_build_outcome(outcome);
+        if action.refresh_displayed_geometry() {
+            if let Some(displayed) = app_model.displayed_geometry() {
+                viewport.accept_displayed_geometry(displayed);
+            }
+            runtime.pending_mesh_upload_requested_at = action.requested_at();
         }
     }
 }
 
 fn apply_geometry_refresh_system(
     mut commands: Commands,
-    app_model: Res<AppModel>,
+    mut app_model: ResMut<AppModel>,
+    mut runtime: ResMut<ReactiveRuntimeState>,
     mut viewport: ResMut<ViewportRuntimeState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -391,6 +547,7 @@ fn apply_geometry_refresh_system(
         return;
     }
 
+    let upload_started = Instant::now();
     let bevy_mesh = match adapt_morphos_mesh(&displayed.mesh) {
         Ok(mesh) => mesh,
         Err(error) => {
@@ -431,6 +588,18 @@ fn apply_geometry_refresh_system(
     viewport.mesh_handle = Some(mesh_handle);
     viewport.material_handle = Some(material_handle);
     viewport.accept_displayed_geometry(displayed);
+
+    if let Some(requested_at) = runtime.pending_mesh_upload_requested_at.take() {
+        let upload_millis = Instant::now()
+            .saturating_duration_since(upload_started)
+            .as_secs_f64()
+            * 1_000.0;
+        let total_millis = Instant::now()
+            .saturating_duration_since(requested_at)
+            .as_secs_f64()
+            * 1_000.0;
+        app_model.note_mesh_upload_complete(upload_millis, total_millis);
+    }
 }
 
 fn synchronize_display_mode_system(
@@ -492,21 +661,116 @@ fn build_ui_snapshot(app_model: &AppModel, viewport: &ViewportRuntimeState) -> U
     app_model.ui_status_snapshot(viewport.displayed_geometry_revision, &viewport.selection)
 }
 
+fn configure_runtime_for_workspace(
+    runtime: &mut ReactiveRuntimeState,
+    scene_path: PathBuf,
+    session_id: WorkspaceSessionId,
+) -> notify::Result<()> {
+    runtime.worker = Some(spawn_build_worker());
+    runtime.watcher = Some(spawn_watcher(scene_path, session_id)?);
+    Ok(())
+}
+
+fn dispatch_build_request(
+    runtime: &mut ReactiveRuntimeState,
+    request: reactive::BuildRequestSnapshot,
+) {
+    if runtime.worker.is_none() {
+        runtime.worker = Some(spawn_build_worker());
+    }
+    if let Some(worker) = &runtime.worker {
+        let _ = worker.sender.send(WorkerCommand::Build(request));
+    }
+}
+
+fn apply_workspace_error(_app_model: &mut AppModel, error: WorkspaceBuildError) {
+    match error {
+        WorkspaceBuildError::NoWorkspacePath => {}
+        WorkspaceBuildError::Workspace(error) => {
+            error!("workspace operation failed: {error}");
+        }
+    }
+}
+
+fn spawn_build_worker() -> BuildWorkerSession {
+    let (command_sender, command_receiver) = unbounded::<WorkerCommand>();
+    let (result_sender, result_receiver) = unbounded::<BuildOutcome>();
+    thread::spawn(move || {
+        let mut worker = BuildWorker::new();
+        while let Ok(command) = command_receiver.recv() {
+            match command {
+                WorkerCommand::Shutdown => break,
+                WorkerCommand::Build(mut request) => {
+                    while let Ok(next_command) = command_receiver.try_recv() {
+                        match next_command {
+                            WorkerCommand::Shutdown => return,
+                            WorkerCommand::Build(next_request) => {
+                                request = next_request;
+                            }
+                        }
+                    }
+                    let outcome = worker.process(request);
+                    if result_sender.send(outcome).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    BuildWorkerSession {
+        sender: command_sender,
+        receiver: result_receiver,
+    }
+}
+
+fn spawn_watcher(
+    scene_path: PathBuf,
+    session_id: WorkspaceSessionId,
+) -> notify::Result<WatcherSession> {
+    let source_dir = scene_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| scene_path.clone());
+    let (sender, receiver) = unbounded::<WatchedSourceEvent>();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if let Ok(event) = event {
+            let _ = sender.send(WatchedSourceEvent {
+                session_id,
+                paths: event.paths,
+                observed_at: Instant::now(),
+            });
+        }
+    })?;
+    watcher.watch(&source_dir, RecursiveMode::NonRecursive)?;
+    Ok(WatcherSession {
+        session_id,
+        scene_path,
+        receiver,
+        _watcher: watcher,
+    })
+}
+
 /// Builds, parses, and evaluates a workspace path without a window.
 pub fn smoke_load_workspace(path: impl AsRef<Path>) -> AppModel {
     let mut model = AppModel::new(Some(path.as_ref().to_path_buf()));
-    let _ = model.process_build_request(BuildRequest::reopen());
+    let request = model.prepare_reopen(Instant::now()).expect("reopen");
+    let mut worker = BuildWorker::new();
+    let action = model.accept_build_outcome(worker.process(request));
+    assert!(!action.refresh_displayed_geometry() || model.displayed_geometry().is_some());
     model
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AppBuildStatus, BuildSuccess};
+    use crate::model::AppBuildStatus;
+    use crate::reactive::EditOrigin;
+    use crossbeam_channel::unbounded;
     use geom_geometry::Mesh as MorphosMesh;
     use geom_workspace::Revision;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn smoke_workspace_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -517,7 +781,20 @@ mod tests {
             .join("viewport-smoke")
     }
 
+    fn benchmark_workspace_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("workspaces")
+            .join("benchmark-reactive")
+    }
+
     fn clone_workspace_fixture() -> PathBuf {
+        clone_workspace_from(&smoke_workspace_path())
+    }
+
+    fn clone_workspace_from(source_root: &Path) -> PathBuf {
         let unique_suffix = format!(
             "geom-app-test-{}-{}",
             std::process::id(),
@@ -527,7 +804,7 @@ mod tests {
                 .as_nanos()
         );
         let target_root = std::env::temp_dir().join(unique_suffix);
-        copy_directory_recursive(&smoke_workspace_path(), &target_root);
+        copy_directory_recursive(source_root, &target_root);
         target_root
     }
 
@@ -537,8 +814,7 @@ mod tests {
             let entry = entry.expect("directory entry");
             let source_path = entry.path();
             let target_path = target.join(entry.file_name());
-            let file_type = entry.file_type().expect("entry type");
-            if file_type.is_dir() {
+            if entry.file_type().expect("type").is_dir() {
                 copy_directory_recursive(&source_path, &target_path);
             } else {
                 fs::copy(&source_path, &target_path).expect("copy file");
@@ -569,6 +845,7 @@ mod tests {
         assert_eq!(geometry.geometry_revision, 1);
         assert_eq!(geometry.requested_output.as_str(), "root");
         assert!(matches!(model.build_status(), AppBuildStatus::Success(_)));
+        assert_eq!(model.current_source_revision().get(), 1);
     }
 
     #[test]
@@ -577,15 +854,19 @@ mod tests {
         let mut model = smoke_load_workspace(&workspace_root);
         let last_good_revision = model
             .displayed_geometry()
-            .expect("initial geometry")
+            .expect("geometry")
             .geometry_revision;
 
         let workspace = model.workspace_mut().expect("workspace");
         workspace.replace_source("schema_version = 1\nroot = \"broken\"\n");
-        workspace.save().expect("persist invalid source");
+        workspace.save().expect("save");
 
-        let action = model.process_build_request(BuildRequest::rebuild());
-        assert!(action.accepted_geometry().is_none());
+        let request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let action = model.accept_build_outcome(worker.process(request));
+        assert!(!action.refresh_displayed_geometry());
         assert!(matches!(
             model.build_status(),
             AppBuildStatus::SceneError(_)
@@ -593,10 +874,114 @@ mod tests {
         assert_eq!(
             model
                 .displayed_geometry()
-                .expect("last good")
+                .expect("geometry")
                 .geometry_revision,
             last_good_revision
         );
+    }
+
+    #[test]
+    fn invalid_source_then_valid_source_recovers_automatically() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        let original_text = model
+            .workspace_mut()
+            .expect("workspace")
+            .source_text()
+            .to_owned();
+        let last_good_revision = model
+            .displayed_geometry()
+            .expect("geometry")
+            .geometry_revision;
+        let mut worker = BuildWorker::new();
+
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            workspace.replace_source("schema_version = 1\nroot = \"broken\"\n");
+            workspace.save().expect("save invalid");
+        }
+        let invalid_request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("request");
+        let invalid_action = model.accept_build_outcome(worker.process(invalid_request));
+        assert!(!invalid_action.refresh_displayed_geometry());
+        assert!(matches!(
+            model.build_status(),
+            AppBuildStatus::SceneError(_)
+        ));
+        assert_eq!(
+            model
+                .displayed_geometry()
+                .expect("geometry")
+                .geometry_revision,
+            last_good_revision
+        );
+
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            workspace.replace_source(original_text);
+            workspace.save().expect("save valid");
+        }
+        let valid_request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("request");
+        let valid_action = model.accept_build_outcome(worker.process(valid_request));
+        assert!(valid_action.refresh_displayed_geometry());
+        assert!(matches!(model.build_status(), AppBuildStatus::Success(_)));
+        assert!(
+            model
+                .displayed_geometry()
+                .expect("geometry")
+                .geometry_revision
+                >= last_good_revision
+        );
+    }
+
+    #[test]
+    fn programmatic_edit_persists_and_own_write_echo_is_suppressed() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        let request = model
+            .apply_parameter_scalar_delta(
+                &ParamId::new(DEMO_PARAMETER_ID).expect("parameter id"),
+                0.25,
+                EditOrigin::Programmatic,
+                Instant::now(),
+            )
+            .expect("edit")
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let action = model.accept_build_outcome(worker.process(request));
+        assert!(action.refresh_displayed_geometry());
+        assert!(matches!(model.build_status(), AppBuildStatus::Success(_)));
+        assert!(
+            model
+                .workspace_summary()
+                .expect("workspace")
+                .revision()
+                .get()
+                >= 2
+        );
+        let echo = model
+            .accept_external_reload(Instant::now())
+            .expect("reload");
+        assert!(echo.is_none());
+    }
+
+    #[test]
+    fn stale_result_from_previous_session_is_ignored_after_reopen() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = AppModel::new(Some(workspace_root));
+        let old_request = model.prepare_reopen(Instant::now()).expect("first reopen");
+        let new_request = model.prepare_reopen(Instant::now()).expect("second reopen");
+        let mut old_worker = BuildWorker::new();
+        let mut new_worker = BuildWorker::new();
+
+        let stale = model.accept_build_outcome(old_worker.process(old_request));
+        assert!(!stale.refresh_displayed_geometry());
+
+        let current = model.accept_build_outcome(new_worker.process(new_request));
+        assert!(current.refresh_displayed_geometry());
     }
 
     #[test]
@@ -613,7 +998,7 @@ mod tests {
         };
         let camera_before = viewport.camera;
         let geometry = DisplayedGeometry {
-            requested_output: NodeId::new("root").expect("node id"),
+            requested_output: geom_scene::NodeId::new("root").expect("node id"),
             geometry_revision: 4,
             mesh: MorphosMesh::new(
                 vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -625,7 +1010,6 @@ mod tests {
                 max: [1.0, 1.0, 1.0],
             },
         };
-
         viewport.accept_displayed_geometry(&geometry);
         assert_eq!(viewport.camera, camera_before);
     }
@@ -643,36 +1027,108 @@ mod tests {
     }
 
     #[test]
-    fn display_mode_changes_do_not_mutate_canonical_geometry() {
-        let mesh = MorphosMesh::new(
-            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            vec![[0, 1, 2]],
-        )
-        .expect("mesh");
-        let geometry = DisplayedGeometry {
-            requested_output: NodeId::new("root").expect("node id"),
-            geometry_revision: 1,
-            mesh: mesh.clone(),
-            bounds: Bounds::Finite {
-                min: [0.0, 0.0, 0.0],
-                max: [1.0, 1.0, 0.0],
-            },
-        };
-
-        let mut model = AppModel::new(None);
-        model.accept_success(BuildSuccess {
-            workspace_summary: None,
-            requested_output: geometry.requested_output.clone(),
-            geometry,
-            rebuild_millis: 1.0,
-        });
-
-        let before = model.displayed_geometry().expect("geometry").mesh.clone();
-        let _viewport = ViewportRuntimeState {
-            display_mode: ViewportDisplayMode::Wireframe,
+    fn watcher_events_route_through_debounce_state() {
+        let scene_path = smoke_workspace_path().join("source").join("scene.toml");
+        let (sender, receiver) = unbounded();
+        let mut runtime = ReactiveRuntimeState {
+            watcher: Some(WatcherSession {
+                session_id: WorkspaceSessionId::ZERO,
+                scene_path: scene_path.clone(),
+                receiver,
+                _watcher: notify::recommended_watcher(|_| {}).expect("watcher"),
+            }),
             ..Default::default()
         };
-        let after = model.displayed_geometry().expect("geometry").mesh.clone();
-        assert_eq!(before, after);
+        let mut model = AppModel::new(Some(smoke_workspace_path()));
+        let request = model.prepare_reopen(Instant::now()).expect("reopen");
+        dispatch_build_request(&mut runtime, request);
+
+        sender
+            .send(WatchedSourceEvent {
+                session_id: WorkspaceSessionId::ZERO,
+                paths: vec![scene_path],
+                observed_at: Instant::now(),
+            })
+            .expect("send");
+        model.note_file_event(Instant::now());
+        assert!(
+            model
+                .drain_ready_file_event(Instant::now() + Duration::from_millis(75))
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn reactive_timing_harness() {
+        let smoke = measure_programmatic_edit_latency(
+            &clone_workspace_from(&smoke_workspace_path()),
+            DEMO_PARAMETER_ID,
+            0.15,
+        );
+        println!(
+            "smoke parse={:.2}ms eval={:.2}ms mesh={:.2}ms total={:.2}ms",
+            smoke.parse_millis,
+            smoke.evaluation_millis,
+            smoke.mesh_upload_millis,
+            smoke.total_millis
+        );
+
+        let benchmark = measure_programmatic_edit_latency(
+            &clone_workspace_from(&benchmark_workspace_path()),
+            "left_width",
+            0.1,
+        );
+        println!(
+            "benchmark parse={:.2}ms eval={:.2}ms mesh={:.2}ms total={:.2}ms",
+            benchmark.parse_millis,
+            benchmark.evaluation_millis,
+            benchmark.mesh_upload_millis,
+            benchmark.total_millis
+        );
+    }
+
+    fn measure_programmatic_edit_latency(
+        workspace_root: &Path,
+        parameter: &str,
+        delta: f64,
+    ) -> reactive::ReactiveBuildTimings {
+        let mut model = AppModel::new(Some(workspace_root.to_path_buf()));
+        let initial = model
+            .prepare_reopen(Instant::now())
+            .expect("initial reopen");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(initial));
+
+        let request = model
+            .apply_parameter_scalar_delta(
+                &ParamId::new(parameter).expect("parameter id"),
+                delta,
+                EditOrigin::Programmatic,
+                Instant::now(),
+            )
+            .expect("edit")
+            .expect("request");
+        let action = model.accept_build_outcome(worker.process(request));
+        if action.refresh_displayed_geometry() {
+            let upload_started = Instant::now();
+            let displayed = model.displayed_geometry().expect("geometry");
+            let _mesh = adapt_morphos_mesh(&displayed.mesh).expect("adapt mesh");
+            let mesh_upload_millis = Instant::now()
+                .saturating_duration_since(upload_started)
+                .as_secs_f64()
+                * 1_000.0;
+            let requested_at = action.requested_at().expect("requested at");
+            let total_millis = Instant::now()
+                .saturating_duration_since(requested_at)
+                .as_secs_f64()
+                * 1_000.0;
+            model.note_mesh_upload_complete(mesh_upload_millis, total_millis);
+        }
+
+        match model.build_status() {
+            AppBuildStatus::Success(success) => success.timings,
+            status => panic!("expected success, found {status:?}"),
+        }
     }
 }

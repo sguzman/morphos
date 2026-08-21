@@ -14,10 +14,10 @@ foundation from M01, the declarative `geom_scene` schema layer from M02, and the
 reopen a workspace; parse, validate, canonically serialize, and source-edit versioned TOML scene
 documents; deterministically evaluate a validated `SceneDocument` into Morphos-owned mesh,
 bounds, and statistics results through a backend-neutral geometry API with selective evaluation
-and dependency-aware caching; and launch the first desktop viewport shell through `geom_app`.
-The current app shell can open a workspace path, evaluate its root geometry, render it in a Bevy
-viewport, show workspace/build state through egui, and manually reload/reopen without live file
-watching or editing UI. CLI product commands and AI integration remain future work.
+and dependency-aware caching; launch the first desktop viewport shell through `geom_app`; and
+reactively rebuild the viewport from external or in-app source edits through a watched
+`source/scene.toml` loop with last-good preview preservation, stale-result suppression, and
+timing instrumentation. CLI product commands and AI integration remain future work.
 
 ## Architecture invariants
 
@@ -38,14 +38,16 @@ watching or editing UI. CLI product commands and AI integration remain future wo
   canonical serialization, and source-preserving edits.
 - `crates/geom_geometry`: the backend-neutral geometry IR, evaluation graph, cache, and headless
   mesh-generation crate introduced in M03.
-- `crates/geom_app`: the M04 desktop viewport shell built with Bevy 0.19.1 and bevy_egui 0.41.1.
+- `crates/geom_app`: the M05 desktop viewport shell built with Bevy 0.19.1 and bevy_egui 0.41.1,
+  including reactive file watching and build orchestration.
 - `docs/architecture.md`: the bootstrap architecture contract and development rules.
 - `docs/scene-schema.md`: the M02 scene grammar, conventions, edit model, and workspace
   relationship.
 - `docs/geometry-evaluation.md`: the M03 geometry IR, backend boundary, caching, and transform
   contract.
-- `docs/viewport.md`: the M04 launch command, camera mapping, and manual viewport verification
-  checklist.
+- `docs/viewport.md`: viewport launch, camera mapping, and manual viewport verification.
+- `docs/reactive-editing.md`: the M05 watcher architecture, generation semantics, own-write
+  suppression, timing harness, and reactive verification procedure.
 - `milestones/`: canonical milestone files and milestone index.
 - `.github/workflows/ci.yml`: baseline continuous integration workflow.
 - `tmp/`: local reference material only; intentionally ignored and never canonical.
@@ -68,6 +70,7 @@ watching or editing UI. CLI product commands and AI integration remain future wo
 - Format: `cargo fmt --check`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Launch the viewport shell: `cargo run -p geom_app -- examples/workspaces/viewport-smoke`
+- Measure reactive timings: `cargo test -p geom_app reactive_timing_harness -- --ignored --nocapture`
 
 The baseline lint policy for M00 is that workspace Clippy warnings are treated as errors.
 

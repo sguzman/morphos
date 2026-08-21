@@ -26,9 +26,10 @@ Manual verification checklist:
 10. Confirm wireframe mode toggles on and off from the top status UI.
 11. Confirm `Frame All` reframes the full displayed geometry.
 12. Confirm `Frame Selected` reframes the selected/current output geometry.
-13. Confirm `Reload / Rebuild` refreshes geometry after editing `source/scene.toml`.
-14. Confirm the camera does not reset across successful geometry rebuilds.
-15. Confirm parse or geometry errors appear in the UI without closing the app.
+13. Confirm external saves to `source/scene.toml` refresh geometry automatically without pressing `Reload / Rebuild`.
+14. Confirm `Reload / Rebuild` still works and routes through the same common rebuild path.
+15. Confirm the camera does not reset across successful reactive geometry rebuilds.
+16. Confirm parse or geometry errors appear in the UI without closing the app and that the last good mesh remains visible.
 
 Environment note:
 
