@@ -225,6 +225,235 @@ impl SceneSource {
         self.refresh_after_edit()
     }
 
+    /// Updates the root/output node reference.
+    pub fn set_root_node(&mut self, node: &NodeId) -> Result<SceneDocument, SceneError> {
+        self.document["root"] = value(node.as_str());
+        self.refresh_after_edit()
+    }
+
+    /// Updates or clears a node label in place and revalidates the result.
+    pub fn set_node_label(
+        &mut self,
+        node: &NodeId,
+        label: Option<&str>,
+    ) -> Result<SceneDocument, SceneError> {
+        let node_table = self.lookup_node_table_mut(node)?;
+        match label.map(str::trim).filter(|label| !label.is_empty()) {
+            Some(label) => {
+                node_table["label"] = value(label);
+            }
+            None => {
+                node_table.remove("label");
+            }
+        }
+        self.refresh_after_edit()
+    }
+
+    /// Updates composition children in place and revalidates the result.
+    pub fn set_composition_children(
+        &mut self,
+        node: &NodeId,
+        children: &[NodeId],
+    ) -> Result<SceneDocument, SceneError> {
+        let text = self.text.clone();
+        if children.len() < 2 {
+            return Err(SceneError::new(
+                SceneErrorKind::InvalidValue {
+                    context: format!("nodes.{}.children", node.as_str()),
+                    message: "composition nodes require at least two child references".to_owned(),
+                },
+                None,
+            ));
+        }
+
+        let node_table = self.lookup_node_table_mut(node)?;
+        let kind_item = node_table.get("kind").ok_or_else(|| {
+            SceneError::new(
+                missing_field_error("kind", Some(node.as_str().to_owned())),
+                None,
+            )
+        })?;
+        let kind = parse_string_item(kind_item, "kind", &text)?;
+        if !matches!(kind.as_str(), "union" | "difference" | "intersection") {
+            return Err(SceneError::new(
+                SceneErrorKind::InvalidEditTarget {
+                    message: format!("node `{node}` is not a composition node"),
+                },
+                span_for_item(node_table.get("kind"), &text),
+            ));
+        }
+
+        let mut array = toml_edit::Array::default();
+        for child in children {
+            array.push(child.as_str());
+        }
+        node_table["children"] = Item::Value(Value::Array(array));
+        self.refresh_after_edit()
+    }
+
+    /// Adds a new node table with a default transform and kind-specific fields.
+    pub fn add_node(
+        &mut self,
+        node: &NodeId,
+        kind: SceneNodeDraft,
+    ) -> Result<SceneDocument, SceneError> {
+        let nodes_table = match self.document.get_mut("nodes").and_then(Item::as_table_mut) {
+            Some(table) => table,
+            None => return Err(SceneError::new(missing_field_error("nodes", None), None)),
+        };
+        if nodes_table.contains_key(node.as_str()) {
+            return Err(SceneError::new(
+                SceneErrorKind::InvalidIdentifier {
+                    kind: "node",
+                    value: format!("{} already exists", node.as_str()),
+                },
+                None,
+            ));
+        }
+
+        let mut table = Table::new();
+        table["kind"] = value(kind.kind_name());
+        if let Some(label) = kind.default_label() {
+            table["label"] = value(label);
+        }
+        for (key, item) in kind.kind_specific_items() {
+            table[key] = item;
+        }
+        table["transform"] = default_transform_item();
+        nodes_table.insert(node.as_str(), Item::Table(table));
+        self.refresh_after_edit()
+    }
+
+    /// Renames a node and updates root/child references.
+    pub fn rename_node(
+        &mut self,
+        from: &NodeId,
+        to: &NodeId,
+    ) -> Result<SceneDocument, SceneError> {
+        if from == to {
+            return self.validate();
+        }
+
+        let old_item = {
+            let nodes_table = match self.document.get_mut("nodes").and_then(Item::as_table_mut) {
+                Some(table) => table,
+                None => return Err(SceneError::new(missing_field_error("nodes", None), None)),
+            };
+            if nodes_table.contains_key(to.as_str()) {
+                return Err(SceneError::new(
+                    SceneErrorKind::InvalidIdentifier {
+                        kind: "node",
+                        value: format!("{} already exists", to.as_str()),
+                    },
+                    None,
+                ));
+            }
+            nodes_table.remove(from.as_str()).ok_or_else(|| {
+                SceneError::new(
+                    SceneErrorKind::MissingNode { node: from.clone() },
+                    None,
+                )
+            })?
+        };
+
+        {
+            let nodes_table = self
+                .document
+                .get_mut("nodes")
+                .and_then(Item::as_table_mut)
+                .expect("nodes table exists");
+            nodes_table.insert(to.as_str(), old_item);
+
+            for (_node_key, node_item) in nodes_table.iter_mut() {
+                let Some(node_table) = node_item.as_table_mut() else {
+                    continue;
+                };
+                let Some(children) =
+                    node_table.get_mut("children").and_then(Item::as_array_mut)
+                else {
+                    continue;
+                };
+                for child in children.iter_mut() {
+                    if child.as_str().is_some_and(|value| value == from.as_str()) {
+                        *child = Value::from(to.as_str());
+                    }
+                }
+            }
+        }
+
+        let root_matches = self
+            .document
+            .get("root")
+            .and_then(Item::as_str)
+            .is_some_and(|current| current == from.as_str());
+        if root_matches {
+            self.document["root"] = value(to.as_str());
+        }
+
+        self.refresh_after_edit()
+    }
+
+    /// Duplicates an existing node table under a new ID.
+    pub fn duplicate_node(
+        &mut self,
+        source: &NodeId,
+        duplicate: &NodeId,
+    ) -> Result<SceneDocument, SceneError> {
+        let source_item = {
+            let nodes_table = match self.document.get("nodes").and_then(Item::as_table) {
+                Some(table) => table,
+                None => return Err(SceneError::new(missing_field_error("nodes", None), None)),
+            };
+            if nodes_table.contains_key(duplicate.as_str()) {
+                return Err(SceneError::new(
+                    SceneErrorKind::InvalidIdentifier {
+                        kind: "node",
+                        value: format!("{} already exists", duplicate.as_str()),
+                    },
+                    None,
+                ));
+            }
+            nodes_table
+                .get(source.as_str())
+                .cloned()
+                .ok_or_else(|| SceneError::new(SceneErrorKind::MissingNode { node: source.clone() }, None))?
+        };
+
+        let nodes_table = self
+            .document
+            .get_mut("nodes")
+            .and_then(Item::as_table_mut)
+            .expect("nodes table exists");
+        nodes_table.insert(duplicate.as_str(), source_item);
+        self.refresh_after_edit()
+    }
+
+    /// Deletes a node table. Callers remain responsible for dependency policy.
+    pub fn delete_node(&mut self, node: &NodeId) -> Result<SceneDocument, SceneError> {
+        let nodes_table = match self.document.get_mut("nodes").and_then(Item::as_table_mut) {
+            Some(table) => table,
+            None => return Err(SceneError::new(missing_field_error("nodes", None), None)),
+        };
+        let removed = nodes_table.remove(node.as_str()).is_some();
+        if !removed {
+            return Err(SceneError::new(
+                SceneErrorKind::MissingNode { node: node.clone() },
+                None,
+            ));
+        }
+        self.refresh_after_edit()
+    }
+
+    /// Returns a simple source hook for a node table header if present.
+    pub fn node_source_location(&self, node: &NodeId) -> Option<SourceLocation> {
+        find_header_location(&self.text, &format!("[nodes.{}]", node.as_str()))
+    }
+
+    /// Returns a simple source hook for a parameter table header if present.
+    pub fn parameter_source_location(&self, parameter: &ParamId) -> Option<SourceLocation> {
+        find_header_location(&self.text, &format!("[params.{}]", parameter.as_str()))
+    }
+
     fn lookup_node_table_mut(&mut self, node: &NodeId) -> Result<&mut Table, SceneError> {
         let nodes_table = match self.document.get_mut("nodes").and_then(Item::as_table_mut) {
             Some(table) => table,
@@ -730,6 +959,14 @@ pub struct SourceSpan {
     pub end_column: usize,
 }
 
+/// A lightweight source reveal hook for GUI callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocation {
+    pub byte_offset: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
 impl SourceSpan {
     fn from_range(source: &str, range: Range<usize>) -> Self {
         let (start_line, start_column) = line_column_at(source, range.start);
@@ -892,6 +1129,60 @@ pub enum PrimitiveScalarField {
     PlaneDepth,
     ProfileWidth,
     ProfileHeight,
+}
+
+/// A new scene node template used by M06 GUI creation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SceneNodeDraft {
+    Box,
+    Sphere,
+    Cylinder,
+    Capsule,
+    Plane,
+    Profile,
+    Union { children: Vec<NodeId> },
+    Difference { children: Vec<NodeId> },
+    Intersection { children: Vec<NodeId> },
+}
+
+impl SceneNodeDraft {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Box => "box",
+            Self::Sphere => "sphere",
+            Self::Cylinder => "cylinder",
+            Self::Capsule => "capsule",
+            Self::Plane => "plane",
+            Self::Profile => "profile",
+            Self::Union { .. } => "union",
+            Self::Difference { .. } => "difference",
+            Self::Intersection { .. } => "intersection",
+        }
+    }
+
+    fn default_label(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn kind_specific_items(&self) -> Vec<(&'static str, Item)> {
+        match self {
+            Self::Box => vec![("size", default_xyz_inline_item(1.0, 1.0, 1.0))],
+            Self::Sphere => vec![("radius", value(0.5))],
+            Self::Cylinder => vec![("radius", value(0.5)), ("height", value(1.0))],
+            Self::Capsule => vec![("radius", value(0.25)), ("height", value(1.0))],
+            Self::Plane => vec![("width", value(1.0)), ("depth", value(1.0))],
+            Self::Profile => vec![("width", value(1.0)), ("height", value(1.0))],
+            Self::Union { children }
+            | Self::Difference { children }
+            | Self::Intersection { children } => {
+                let mut array = toml_edit::Array::default();
+                for child in children {
+                    array.push(child.as_str());
+                }
+                vec![("children", Item::Value(Value::Array(array)))]
+            }
+        }
+    }
 }
 
 impl PrimitiveScalarField {
@@ -2233,6 +2524,36 @@ fn write_extension_table(output: &mut String, extensions: &SceneExtensions, inde
 
 fn escape_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn default_transform_item() -> Item {
+    let mut transform = InlineTable::new();
+    transform.insert("translate", default_xyz_inline_value(0.0, 0.0, 0.0));
+    transform.insert("rotate_deg", default_xyz_inline_value(0.0, 0.0, 0.0));
+    transform.insert("scale", default_xyz_inline_value(1.0, 1.0, 1.0));
+    Item::Value(Value::InlineTable(transform))
+}
+
+fn default_xyz_inline_item(x: f64, y: f64, z: f64) -> Item {
+    Item::Value(default_xyz_inline_value(x, y, z))
+}
+
+fn default_xyz_inline_value(x: f64, y: f64, z: f64) -> Value {
+    let mut table = InlineTable::new();
+    table.insert("x", Value::from(x));
+    table.insert("y", Value::from(y));
+    table.insert("z", Value::from(z));
+    Value::InlineTable(table)
+}
+
+fn find_header_location(source: &str, header: &str) -> Option<SourceLocation> {
+    let byte_offset = source.find(header)?;
+    let (line, column) = line_column_at(source, byte_offset);
+    Some(SourceLocation {
+        byte_offset,
+        line,
+        column,
+    })
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ pub mod camera;
 pub mod mesh_adapter;
 pub mod model;
 pub mod reactive;
+pub mod scene_tree;
 pub mod viewport;
 
 use bevy::input::mouse::{MouseMotion, MouseWheel};
@@ -11,7 +12,9 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use camera::{CameraFrame, OrbitCameraInputMap, OrbitCameraState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use geom_geometry::Bounds;
-use geom_scene::ParamId;
+use geom_scene::{
+    Axis, NodeId, ParamId, PrimitiveScalarField, SceneNodeDraft, TransformProperty,
+};
 use mesh_adapter::adapt_morphos_mesh;
 use model::{
     AppEditError, AppModel, BuildStatusKind, DisplayedGeometry, UiStatusSnapshot,
@@ -58,6 +61,7 @@ pub fn build_app(workspace_path: Option<PathBuf>) -> App {
         .insert_resource(AppModel::new(workspace_path))
         .insert_resource(ViewportRuntimeState::default())
         .insert_resource(UiPointerCapture::default())
+        .insert_resource(SceneEditorUiState::default())
         .insert_resource(ReactiveRuntimeState::default())
         .add_message::<AppCommand>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -93,13 +97,26 @@ pub fn run_app(workspace_path: Option<PathBuf>) {
 }
 
 #[derive(Debug, Clone, Message)]
+#[allow(dead_code)]
 enum AppCommand {
     Rebuild,
     Reopen,
     FrameAll,
     FrameSelected,
     SetDisplayMode(ViewportDisplayMode),
+    SetMeshVisibility(bool),
+    SelectNode(Option<NodeId>),
     AdjustParameterScalar(ParamId, f64),
+    SetParameterScalar(ParamId, f64),
+    SetTransformComponent(NodeId, TransformProperty, Axis, f64),
+    SetPrimitiveScalar(NodeId, PrimitiveScalarField, f64),
+    SetNodeLabel(NodeId, Option<String>),
+    RenameNode(NodeId, NodeId),
+    DuplicateNode(NodeId, NodeId),
+    DeleteNode(NodeId),
+    SetRootNode(NodeId),
+    AddNode(NodeId, SceneNodeDraft),
+    SetCompositionChildren(NodeId, Vec<NodeId>),
 }
 
 #[derive(Debug, Default, Resource)]
@@ -115,6 +132,7 @@ struct ViewportRuntimeState {
     displayed_geometry_revision: DisplayGeometryRevision,
     displayed_output: Option<String>,
     displayed_bounds: Option<Bounds>,
+    mesh_visible: bool,
     render_entity: Option<Entity>,
     mesh_handle: Option<Handle<Mesh>>,
     material_handle: Option<Handle<StandardMaterial>>,
@@ -129,6 +147,7 @@ impl Default for ViewportRuntimeState {
             displayed_geometry_revision: DisplayGeometryRevision::ZERO,
             displayed_output: None,
             displayed_bounds: None,
+            mesh_visible: true,
             render_entity: None,
             mesh_handle: None,
             material_handle: None,
@@ -141,7 +160,6 @@ impl ViewportRuntimeState {
         self.displayed_geometry_revision = DisplayGeometryRevision::new(geometry.geometry_revision);
         self.displayed_output = Some(geometry.requested_output.to_string());
         self.displayed_bounds = Some(geometry.bounds.clone());
-        self.selection.selected_node = Some(geometry.requested_output.clone());
     }
 
     fn frame_all(&mut self, aspect_ratio: f32) {
@@ -182,6 +200,71 @@ struct MorphosCamera;
 
 #[derive(Debug, Component)]
 struct MorphosGeometryEntity;
+
+#[derive(Debug, Resource)]
+#[allow(dead_code)]
+struct SceneEditorUiState {
+    search_query: String,
+    label_buffer: String,
+    rename_buffer: String,
+    duplicate_buffer: String,
+    add_node_id: String,
+    add_kind: AddNodeKind,
+    selected_node_cache: Option<NodeId>,
+}
+
+impl Default for SceneEditorUiState {
+    fn default() -> Self {
+        Self {
+            search_query: String::new(),
+            label_buffer: String::new(),
+            rename_buffer: String::new(),
+            duplicate_buffer: String::new(),
+            add_node_id: "new_node".to_owned(),
+            add_kind: AddNodeKind::Box,
+            selected_node_cache: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum AddNodeKind {
+    Box,
+    Sphere,
+    Cylinder,
+    Capsule,
+    Plane,
+    Profile,
+}
+
+impl AddNodeKind {
+    fn all() -> [Self; 6] {
+        [Self::Box, Self::Sphere, Self::Cylinder, Self::Capsule, Self::Plane, Self::Profile]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Box => "box",
+            Self::Sphere => "sphere",
+            Self::Cylinder => "cylinder",
+            Self::Capsule => "capsule",
+            Self::Plane => "plane",
+            Self::Profile => "profile",
+        }
+    }
+
+    fn draft(self) -> SceneNodeDraft {
+        match self {
+            Self::Box => SceneNodeDraft::Box,
+            Self::Sphere => SceneNodeDraft::Sphere,
+            Self::Cylinder => SceneNodeDraft::Cylinder,
+            Self::Capsule => SceneNodeDraft::Capsule,
+            Self::Plane => SceneNodeDraft::Plane,
+            Self::Profile => SceneNodeDraft::Profile,
+        }
+    }
+}
 
 fn setup_scene(mut commands: Commands) {
     commands.spawn((
@@ -458,6 +541,12 @@ fn process_app_commands_system(
             AppCommand::SetDisplayMode(mode) => {
                 viewport.display_mode = *mode;
             }
+            AppCommand::SetMeshVisibility(visible) => {
+                viewport.mesh_visible = *visible;
+            }
+            AppCommand::SelectNode(node) => {
+                viewport.selection.select(node.clone());
+            }
             AppCommand::AdjustParameterScalar(parameter, delta) => match app_model
                 .apply_parameter_scalar_delta(parameter, *delta, EditOrigin::Gui, Instant::now())
             {
@@ -472,6 +561,115 @@ fn process_app_commands_system(
                 Err(AppEditError::Conflict(error)) => {
                     warn!("edit conflict: {error}");
                 }
+            },
+            AppCommand::SetParameterScalar(parameter, value) => match app_model
+                .set_parameter_scalar_value(parameter, *value, EditOrigin::Gui, Instant::now())
+            {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("parameter edit failed: {error:?}"),
+            },
+            AppCommand::SetTransformComponent(node, property, axis, value) => match app_model
+                .set_selected_node_transform_literal(
+                    node,
+                    *property,
+                    *axis,
+                    *value,
+                    EditOrigin::Gui,
+                    Instant::now(),
+                ) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("transform edit failed: {error:?}"),
+            },
+            AppCommand::SetPrimitiveScalar(node, field, value) => match app_model
+                .set_selected_node_primitive_literal(
+                    node,
+                    *field,
+                    *value,
+                    EditOrigin::Gui,
+                    Instant::now(),
+                ) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("primitive edit failed: {error:?}"),
+            },
+            AppCommand::SetNodeLabel(node, label) => match app_model.set_node_label(
+                node,
+                label.as_deref(),
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("label edit failed: {error:?}"),
+            },
+            AppCommand::RenameNode(from, to) => match app_model.rename_node(
+                from,
+                to,
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => {
+                    viewport.selection.select(Some(to.clone()));
+                    dispatch_build_request(&mut runtime, request);
+                }
+                Ok(None) => {}
+                Err(error) => warn!("rename failed: {error:?}"),
+            },
+            AppCommand::DuplicateNode(source, duplicate) => match app_model.duplicate_node(
+                source,
+                duplicate,
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => {
+                    viewport.selection.select(Some(duplicate.clone()));
+                    dispatch_build_request(&mut runtime, request);
+                }
+                Ok(None) => {}
+                Err(error) => warn!("duplicate failed: {error:?}"),
+            },
+            AppCommand::DeleteNode(node) => match app_model.delete_node(
+                node,
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => {
+                    viewport.selection.select(None);
+                    dispatch_build_request(&mut runtime, request);
+                }
+                Ok(None) => {}
+                Err(error) => warn!("delete failed: {error:?}"),
+            },
+            AppCommand::SetRootNode(node) => match app_model.set_root_node(
+                node,
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("set root failed: {error:?}"),
+            },
+            AppCommand::AddNode(node, draft) => match app_model.add_node(
+                node,
+                draft.clone(),
+                EditOrigin::Gui,
+                Instant::now(),
+            ) {
+                Ok(Some(request)) => {
+                    viewport.selection.select(Some(node.clone()));
+                    dispatch_build_request(&mut runtime, request);
+                }
+                Ok(None) => {}
+                Err(error) => warn!("add node failed: {error:?}"),
+            },
+            AppCommand::SetCompositionChildren(node, children) => match app_model
+                .set_composition_children(node, children, EditOrigin::Gui, Instant::now())
+            {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("composition edit failed: {error:?}"),
             },
         }
     }
@@ -526,6 +724,7 @@ fn poll_build_results_system(
             if let Some(displayed) = app_model.displayed_geometry() {
                 viewport.accept_displayed_geometry(displayed);
             }
+            app_model.preserve_selection(&mut viewport.selection);
             runtime.pending_mesh_upload_requested_at = action.requested_at();
         }
     }
@@ -620,6 +819,11 @@ fn synchronize_display_mode_system(
                 commands.entity(entity).insert(Wireframe);
             }
         }
+        commands.entity(entity).insert(if viewport.mesh_visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        });
     }
 }
 

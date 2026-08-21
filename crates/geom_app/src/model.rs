@@ -3,10 +3,14 @@ use crate::reactive::{
     DiagnosticStage, EditOrigin, ReactiveBuildSuccess, ReactiveBuildTimings, ReactiveController,
     ReactiveDiagnostic, ReactiveStatusSnapshot, SourceFingerprint, SourceRevision,
 };
+use crate::scene_tree::SceneTreeModel;
 use crate::viewport::DisplayGeometryRevision;
 use bevy::prelude::Resource;
-use geom_geometry::Bounds;
-use geom_scene::{NodeId, ParamId, SceneDocument, SceneSource};
+use geom_geometry::{BoolmeshBackend, Bounds, GeometryEvaluator};
+use geom_scene::{
+    Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SceneSource,
+    SourceLocation, TransformProperty,
+};
 use geom_workspace::{Revision, Workspace, WorkspaceError, WorkspaceSummary};
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +40,10 @@ impl AppModel {
 
     pub fn build_status(&self) -> &AppBuildStatus {
         &self.build_status
+    }
+
+    pub fn current_scene(&self) -> Option<&SceneDocument> {
+        self.last_good_scene.as_ref()
     }
 
     pub fn displayed_geometry(&self) -> Option<&DisplayedGeometry> {
@@ -176,21 +184,19 @@ impl AppModel {
                 AppEditError::Conflict("parameter is unavailable for editing".to_owned())
             })?;
 
-        let mut source =
-            SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
-        source
-            .set_parameter_scalar(parameter, current_value + delta)
-            .map_err(AppEditError::Scene)?;
-        let updated_text = source.into_text();
-        if !workspace.replace_source(updated_text.clone()) {
-            return Ok(None);
-        }
-        workspace.save().map_err(AppEditError::Workspace)?;
-        Ok(Some(self.reactive.accept_internal_source_write(
-            &updated_text,
-            origin,
-            now,
-        )))
+        self.apply_scene_edit(origin, now, |source| {
+            source.set_parameter_scalar(parameter, current_value + delta)
+        })
+    }
+
+    pub fn set_parameter_scalar_value(
+        &mut self,
+        parameter: &ParamId,
+        value: f64,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.set_parameter_scalar(parameter, value))
     }
 
     pub fn parameter_scalar(&self, parameter: &str) -> Option<f64> {
@@ -202,13 +208,145 @@ impl AppModel {
     }
 
     pub fn frame_selected_bounds(&self, selection: &ViewportSelection) -> Option<Bounds> {
-        let displayed = self.displayed_geometry.as_ref()?;
         let selected = selection.selected_node.as_ref()?;
-        if selected == &displayed.requested_output {
-            Some(displayed.bounds.clone())
-        } else {
-            None
+        let scene = self.last_good_scene.as_ref()?;
+        let mut evaluator = GeometryEvaluator::new(BoolmeshBackend::new());
+        evaluator
+            .evaluate_node(scene, selected)
+            .ok()
+            .map(|geometry| geometry.bounds)
+    }
+
+    pub fn scene_tree_model(&self) -> Option<SceneTreeModel> {
+        self.last_good_scene.as_ref().map(SceneTreeModel::from_scene)
+    }
+
+    pub fn editing_disabled_reason(&self) -> Option<&str> {
+        match &self.build_status {
+            AppBuildStatus::SceneError(_) => Some(
+                "editing is disabled while the current source is invalid; fix or reload the source first",
+            ),
+            AppBuildStatus::Conflict(message) => Some(message.as_str()),
+            _ => None,
         }
+    }
+
+    pub fn preserve_selection(&self, selection: &mut ViewportSelection) {
+        let Some(scene) = self.last_good_scene.as_ref() else {
+            selection.selected_node = None;
+            return;
+        };
+        if let Some(selected) = selection.selected_node.as_ref()
+            && scene.nodes().contains_key(selected)
+        {
+            return;
+        }
+        selection.selected_node = Some(scene.root().clone());
+    }
+
+    pub fn set_selected_node_transform_literal(
+        &mut self,
+        node: &NodeId,
+        property: TransformProperty,
+        axis: Axis,
+        value: f64,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| {
+            source.set_transform_component(node, property, axis, value)
+        })
+    }
+
+    pub fn set_selected_node_primitive_literal(
+        &mut self,
+        node: &NodeId,
+        field: PrimitiveScalarField,
+        value: f64,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.set_primitive_scalar(node, field, value))
+    }
+
+    pub fn set_node_label(
+        &mut self,
+        node: &NodeId,
+        label: Option<&str>,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.set_node_label(node, label))
+    }
+
+    pub fn rename_node(
+        &mut self,
+        from: &NodeId,
+        to: &NodeId,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.rename_node(from, to))
+    }
+
+    pub fn duplicate_node(
+        &mut self,
+        source_node: &NodeId,
+        duplicate: &NodeId,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.duplicate_node(source_node, duplicate))
+    }
+
+    pub fn add_node(
+        &mut self,
+        node: &NodeId,
+        draft: SceneNodeDraft,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.add_node(node, draft.clone()))
+    }
+
+    pub fn set_root_node(
+        &mut self,
+        node: &NodeId,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.set_root_node(node))
+    }
+
+    pub fn set_composition_children(
+        &mut self,
+        node: &NodeId,
+        children: &[NodeId],
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.set_composition_children(node, children))
+    }
+
+    pub fn delete_node(
+        &mut self,
+        node: &NodeId,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_scene_edit(origin, now, |source| source.delete_node(node))
+    }
+
+    pub fn node_source_location(&self, node: &NodeId) -> Option<SourceLocation> {
+        let workspace = self.workspace.as_ref()?;
+        let source = SceneSource::parse(workspace.source_text()).ok()?;
+        source.node_source_location(node)
+    }
+
+    pub fn parameter_source_location(&self, parameter: &ParamId) -> Option<SourceLocation> {
+        let workspace = self.workspace.as_ref()?;
+        let source = SceneSource::parse(workspace.source_text()).ok()?;
+        source.parameter_source_location(parameter)
     }
 
     pub fn accept_build_outcome(&mut self, outcome: BuildOutcome) -> BuildApplicationAction {
@@ -407,6 +545,58 @@ impl AppModel {
         self.workspace = Some(workspace);
         Ok(())
     }
+
+    fn apply_scene_edit<F>(
+        &mut self,
+        origin: EditOrigin,
+        now: Instant,
+        edit: F,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError>
+    where
+        F: FnOnce(&mut SceneSource) -> Result<SceneDocument, geom_scene::SceneError>,
+    {
+        if let Some(reason) = self.editing_disabled_reason() {
+            return Err(AppEditError::Conflict(reason.to_owned()));
+        }
+
+        let base_fingerprint = self
+            .reactive
+            .current_source_fingerprint()
+            .ok_or_else(|| AppEditError::Conflict("no current source fingerprint".to_owned()))?;
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+
+        let disk_source =
+            fs::read_to_string(workspace.paths().source_file()).map_err(|source| {
+                AppEditError::Workspace(WorkspaceError::Io {
+                    path: workspace.paths().source_file(),
+                    operation: "read current source for conflict check",
+                    source,
+                })
+            })?;
+        if SourceFingerprint::from_text(&disk_source) != base_fingerprint {
+            let message =
+                "external source changed since the GUI edit base; retry against the newest source"
+                    .to_owned();
+            self.build_status = AppBuildStatus::Conflict(message.clone());
+            return Err(AppEditError::Conflict(message));
+        }
+
+        let mut source = SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
+        edit(&mut source).map_err(AppEditError::Scene)?;
+        let updated_text = source.into_text();
+        if !workspace.replace_source(updated_text.clone()) {
+            return Ok(None);
+        }
+        workspace.save().map_err(AppEditError::Workspace)?;
+        Ok(Some(self.reactive.accept_internal_source_write(
+            &updated_text,
+            origin,
+            now,
+        )))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -460,6 +650,12 @@ pub enum ViewportDisplayMode {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViewportSelection {
     pub selected_node: Option<NodeId>,
+}
+
+impl ViewportSelection {
+    pub fn select(&mut self, node: Option<NodeId>) {
+        self.selected_node = node;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
