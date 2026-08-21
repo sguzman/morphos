@@ -1,0 +1,16 @@
+[package]
+name = "geom_app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bevy = "0.19.1"
+bevy_egui = "0.41.1"
+geom_geometry = { path = "../geom_geometry" }
+geom_scene = { path = "../geom_scene" }
+geom_workspace = { path = "../geom_workspace" }
+
+[lints]
+workspace = true

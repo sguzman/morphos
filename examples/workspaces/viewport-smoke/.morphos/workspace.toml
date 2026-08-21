@@ -1,0 +1,4 @@
+format_version = 1
+workspace_id = "f2fc1a4a-fb7a-4db6-b36b-6bbac3a1f0c8"
+name = "Viewport Smoke"
+description = "Asymmetric smoke workspace for the M04 viewport shell"
