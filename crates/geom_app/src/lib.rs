@@ -100,6 +100,8 @@ pub fn run_app(workspace_path: Option<PathBuf>) {
 enum AppCommand {
     Rebuild,
     Reopen,
+    Undo,
+    Redo,
     FrameAll,
     FrameSelected,
     SetDisplayMode(ViewportDisplayMode),
@@ -385,6 +387,19 @@ fn ui_system(
                 }
                 if ui.button("Reopen Current Workspace").clicked() {
                     commands.write(AppCommand::Reopen);
+                }
+                let availability = app_model.undo_redo_availability();
+                if ui
+                    .add_enabled(availability.can_undo, egui::Button::new("Undo"))
+                    .clicked()
+                {
+                    commands.write(AppCommand::Undo);
+                }
+                if ui
+                    .add_enabled(availability.can_redo, egui::Button::new("Redo"))
+                    .clicked()
+                {
+                    commands.write(AppCommand::Redo);
                 }
                 if ui.button("Frame All").clicked() {
                     commands.write(AppCommand::FrameAll);
@@ -1352,6 +1367,16 @@ fn process_app_commands_system(
                 }
                 Err(error) => apply_workspace_error(&mut app_model, error),
             },
+            AppCommand::Undo => match app_model.undo(EditOrigin::Gui, Instant::now()) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("undo failed: {error:?}"),
+            },
+            AppCommand::Redo => match app_model.redo(EditOrigin::Gui, Instant::now()) {
+                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                Ok(None) => {}
+                Err(error) => warn!("redo failed: {error:?}"),
+            },
             AppCommand::FrameAll => {
                 viewport.frame_all(windows.width() / windows.height().max(1.0));
             }
@@ -2255,6 +2280,88 @@ mod tests {
             geom_scene::ScalarExpr::Literal(value) => assert_eq!(*value, 2.75),
             other => panic!("unexpected translation expr: {other:?}"),
         }
+    }
+
+    #[test]
+    fn undo_and_redo_flow_through_workspace_transaction_and_reopen() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+
+        let request = model
+            .set_parameter_scalar_value(
+                &ParamId::new("arm_length").expect("parameter"),
+                3.8,
+                EditOrigin::Gui,
+                Instant::now(),
+            )
+            .expect("set parameter")
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+        assert!(model.undo_redo_availability().can_undo);
+
+        let request = model
+            .undo(EditOrigin::Gui, Instant::now())
+            .expect("undo")
+            .expect("undo request");
+        let _ = model.accept_build_outcome(worker.process(request));
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("reparse");
+        assert_eq!(
+            reopened.parameters()[&ParamId::new("arm_length").expect("parameter")].scalar_value(),
+            2.6
+        );
+        assert!(model.undo_redo_availability().can_redo);
+
+        let request = model
+            .redo(EditOrigin::Gui, Instant::now())
+            .expect("redo")
+            .expect("redo request");
+        let _ = model.accept_build_outcome(worker.process(request));
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("reparse");
+        assert_eq!(
+            reopened.parameters()[&ParamId::new("arm_length").expect("parameter")].scalar_value(),
+            3.8
+        );
+    }
+
+    #[test]
+    fn external_reload_clears_undo_and_redo_availability() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        let request = model
+            .set_parameter_scalar_value(
+                &ParamId::new("arm_length").expect("parameter"),
+                3.1,
+                EditOrigin::Gui,
+                Instant::now(),
+            )
+            .expect("set parameter")
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+        assert!(model.undo_redo_availability().can_undo);
+
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            let updated = workspace
+                .source_text()
+                .replace("value = 3.1", "value = 4.4");
+            fs::write(workspace.paths().source_file(), updated).expect("write external edit");
+        }
+
+        let request = model
+            .accept_external_reload(Instant::now())
+            .expect("reload")
+            .expect("request");
+        let _ = model.accept_build_outcome(worker.process(request));
+        assert!(!model.undo_redo_availability().can_undo);
+        assert!(!model.undo_redo_availability().can_redo);
     }
 
     #[test]

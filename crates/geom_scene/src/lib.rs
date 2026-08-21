@@ -324,6 +324,16 @@ impl SceneSource {
         self.refresh_after_edit()
     }
 
+    /// Inserts or replaces a full semantic node declaration.
+    pub fn set_node(&mut self, node: &Node) -> Result<SceneDocument, SceneError> {
+        let nodes_table = match self.document.get_mut("nodes").and_then(Item::as_table_mut) {
+            Some(table) => table,
+            None => return Err(SceneError::new(missing_field_error("nodes", None), None)),
+        };
+        nodes_table.insert(node.id().as_str(), Item::Table(node_table_from_node(node)));
+        self.refresh_after_edit()
+    }
+
     /// Renames a node and updates root/child references.
     pub fn rename_node(&mut self, from: &NodeId, to: &NodeId) -> Result<SceneDocument, SceneError> {
         if from == to {
@@ -2528,6 +2538,134 @@ fn default_transform_item() -> Item {
     transform.insert("rotate_deg", default_xyz_inline_value(0.0, 0.0, 0.0));
     transform.insert("scale", default_xyz_inline_value(1.0, 1.0, 1.0));
     Item::Value(Value::InlineTable(transform))
+}
+
+fn node_table_from_node(node: &Node) -> Table {
+    let mut table = Table::new();
+    table["kind"] = value(node.kind().kind_name());
+    if let Some(label) = node.label() {
+        table["label"] = value(label);
+    }
+    match node.kind() {
+        NodeKind::Box(primitive) => {
+            table["size"] = Item::Value(Value::InlineTable(vector3_expr_inline_table(
+                &primitive.size,
+            )));
+        }
+        NodeKind::Sphere(primitive) => {
+            table["radius"] = scalar_expr_item(&primitive.radius);
+        }
+        NodeKind::Cylinder(primitive) => {
+            table["radius"] = scalar_expr_item(&primitive.radius);
+            table["height"] = scalar_expr_item(&primitive.height);
+        }
+        NodeKind::Capsule(primitive) => {
+            table["radius"] = scalar_expr_item(&primitive.radius);
+            table["height"] = scalar_expr_item(&primitive.height);
+        }
+        NodeKind::Plane(primitive) => {
+            table["width"] = scalar_expr_item(&primitive.width);
+            table["depth"] = scalar_expr_item(&primitive.depth);
+        }
+        NodeKind::Profile(primitive) => {
+            table["width"] = scalar_expr_item(&primitive.width);
+            table["height"] = scalar_expr_item(&primitive.height);
+        }
+        NodeKind::Union(composition)
+        | NodeKind::Difference(composition)
+        | NodeKind::Intersection(composition) => {
+            let mut array = toml_edit::Array::default();
+            for child in &composition.children {
+                array.push(child.target().as_str());
+            }
+            table["children"] = Item::Value(Value::Array(array));
+        }
+    }
+    table["transform"] = Item::Value(Value::InlineTable(transform_inline_table(node.transform())));
+    if !node.extensions().is_empty() {
+        table["extensions"] = extension_item(node.extensions());
+    }
+    table
+}
+
+fn transform_inline_table(transform: &Transform) -> InlineTable {
+    let mut table = InlineTable::new();
+    table.insert(
+        "translate",
+        Value::InlineTable(vector3_expr_inline_table(&transform.translation)),
+    );
+    table.insert(
+        "rotate_deg",
+        Value::InlineTable(vector3_expr_inline_table(&transform.rotation_deg)),
+    );
+    table.insert(
+        "scale",
+        Value::InlineTable(vector3_expr_inline_table(&transform.scale)),
+    );
+    table
+}
+
+fn vector3_expr_inline_table(vector: &Vector3Expr) -> InlineTable {
+    let mut table = InlineTable::new();
+    table.insert("x", scalar_expr_value(&vector.x));
+    table.insert("y", scalar_expr_value(&vector.y));
+    table.insert("z", scalar_expr_value(&vector.z));
+    table
+}
+
+fn scalar_expr_item(expression: &ScalarExpr) -> Item {
+    Item::Value(scalar_expr_value(expression))
+}
+
+fn scalar_expr_value(expression: &ScalarExpr) -> Value {
+    match expression {
+        ScalarExpr::Literal(value_number) => Value::from(*value_number),
+        ScalarExpr::Parameter(parameter) => {
+            let mut table = InlineTable::new();
+            table.insert("param", Value::from(parameter.target().as_str()));
+            Value::InlineTable(table)
+        }
+    }
+}
+
+fn extension_item(extensions: &SceneExtensions) -> Item {
+    Item::Value(extension_value(extensions))
+}
+
+fn extension_value(extensions: &SceneExtensions) -> Value {
+    let mut table = InlineTable::new();
+    let mut keys: Vec<_> = extensions.0.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        table.insert(&key, extension_value_from_entry(&extensions.0[&key]));
+    }
+    Value::InlineTable(table)
+}
+
+fn extension_value_from_entry(value: &ExtensionValue) -> Value {
+    match value {
+        ExtensionValue::String(text) => Value::from(text.as_str()),
+        ExtensionValue::Integer(value_number) => Value::from(*value_number),
+        ExtensionValue::Float(value_number) => Value::from(*value_number),
+        ExtensionValue::Bool(value_bool) => Value::from(*value_bool),
+        ExtensionValue::Datetime(text) => Value::from(text.as_str()),
+        ExtensionValue::Array(values) => {
+            let mut array = toml_edit::Array::default();
+            for value in values {
+                array.push(extension_value_from_entry(value));
+            }
+            Value::Array(array)
+        }
+        ExtensionValue::Table(entries) => {
+            let mut table = InlineTable::new();
+            let mut keys: Vec<_> = entries.keys().cloned().collect();
+            keys.sort();
+            for key in keys {
+                table.insert(&key, extension_value_from_entry(&entries[&key]));
+            }
+            Value::InlineTable(table)
+        }
+    }
 }
 
 fn default_xyz_inline_item(x: f64, y: f64, z: f64) -> Item {

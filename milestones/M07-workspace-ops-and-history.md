@@ -32,11 +32,11 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 
 ### Undo/redo
 
-- [ ] Generate or record inverse operations.
-- [ ] Implement undo of a committed transaction.
-- [ ] Implement redo.
-- [ ] Handle new edits after undo by clearing or branching redo state explicitly.
-- [ ] Confirm undo/redo persists through the normal scene serialization path.
+- [x] Generate or record inverse operations.
+- [x] Implement undo of a committed transaction.
+- [x] Implement redo.
+- [x] Handle new edits after undo by clearing or branching redo state explicitly.
+- [x] Confirm undo/redo persists through the normal scene serialization path.
 
 ### History and snapshots
 
@@ -57,18 +57,20 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 
 - [x] Add operation application tests.
 - [x] Add transaction atomicity tests.
-- [ ] Add undo/redo round-trip tests.
+- [x] Add undo/redo round-trip tests.
 - [ ] Add actor/provenance persistence tests.
 - [ ] Add snapshot restore tests.
 - [ ] Add structured diff tests.
 
 ## Notes
 
-- This tranche establishes the transaction foundation only. It intentionally stops before undo,
-  redo, persistent history, snapshots, and rich structured diffs.
+- The first two M07 tranches now cover the transaction foundation plus in-memory transaction-level
+  undo/redo. Persistent history, snapshots, and rich structured diffs remain later work.
 - The current operation surface matches the M06 authoring mutations. A full node-replacement
   operation and workspace-metadata transaction operations remain future work if they become
   necessary.
+- Undo/redo currently operates on in-memory structured transaction records and clears redo on any
+  new post-undo commit rather than branching history.
 
 ## Completion criteria
 

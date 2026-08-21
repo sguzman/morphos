@@ -38,8 +38,8 @@
 //! only when no backup is available.
 
 use geom_scene::{
-    Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SceneSource,
-    TransformProperty,
+    Axis, Node, NodeId, NodeKind, ParamId, PrimitiveScalarField, ScalarExpr, SceneDocument,
+    SceneNodeDraft, SceneSource, TransformProperty,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -474,6 +474,10 @@ pub enum WorkspaceOp {
         node_id: NodeId,
         draft: SceneNodeDraft,
     },
+    ReplaceNode {
+        id: OperationId,
+        node: Box<Node>,
+    },
     DeleteNode {
         id: OperationId,
         node_id: NodeId,
@@ -527,6 +531,7 @@ impl WorkspaceOp {
     pub fn id(&self) -> &OperationId {
         match self {
             Self::AddNode { id, .. }
+            | Self::ReplaceNode { id, .. }
             | Self::DeleteNode { id, .. }
             | Self::RenameNode { id, .. }
             | Self::DuplicateNode { id, .. }
@@ -552,6 +557,9 @@ impl WorkspaceOp {
             | Self::SetRootNode { node_id, .. } => {
                 targets.node_ids.insert(node_id.clone());
             }
+            Self::ReplaceNode { node, .. } => {
+                targets.node_ids.insert(node.id().clone());
+            }
             Self::RenameNode { from, to, .. } => {
                 targets.node_ids.insert(from.clone());
                 targets.node_ids.insert(to.clone());
@@ -574,6 +582,7 @@ impl WorkspaceOp {
     fn apply(&self, source: &mut SceneSource) -> Result<SceneDocument, geom_scene::SceneError> {
         match self {
             Self::AddNode { node_id, draft, .. } => source.add_node(node_id, draft.clone()),
+            Self::ReplaceNode { node, .. } => source.set_node(node),
             Self::DeleteNode { node_id, .. } => source.delete_node(node_id),
             Self::RenameNode { from, to, .. } => source.rename_node(from, to),
             Self::DuplicateNode {
@@ -606,6 +615,87 @@ impl WorkspaceOp {
                 ..
             } => source.set_primitive_scalar(node_id, *field, *value),
             Self::SetRootNode { node_id, .. } => source.set_root_node(node_id),
+        }
+    }
+
+    fn clone_with_new_id(&self) -> Self {
+        match self {
+            Self::AddNode { node_id, draft, .. } => Self::AddNode {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                draft: draft.clone(),
+            },
+            Self::ReplaceNode { node, .. } => Self::ReplaceNode {
+                id: OperationId::new(),
+                node: node.clone(),
+            },
+            Self::DeleteNode { node_id, .. } => Self::DeleteNode {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+            },
+            Self::RenameNode { from, to, .. } => Self::RenameNode {
+                id: OperationId::new(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            Self::DuplicateNode {
+                source_node,
+                duplicate,
+                ..
+            } => Self::DuplicateNode {
+                id: OperationId::new(),
+                source_node: source_node.clone(),
+                duplicate: duplicate.clone(),
+            },
+            Self::SetNodeLabel { node_id, label, .. } => Self::SetNodeLabel {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                label: label.clone(),
+            },
+            Self::SetCompositionChildren {
+                node_id, children, ..
+            } => Self::SetCompositionChildren {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                children: children.clone(),
+            },
+            Self::SetParameterScalar {
+                parameter_id,
+                value,
+                ..
+            } => Self::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: parameter_id.clone(),
+                value: *value,
+            },
+            Self::SetTransformComponent {
+                node_id,
+                property,
+                axis,
+                value,
+                ..
+            } => Self::SetTransformComponent {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                property: *property,
+                axis: *axis,
+                value: *value,
+            },
+            Self::SetPrimitiveScalar {
+                node_id,
+                field,
+                value,
+                ..
+            } => Self::SetPrimitiveScalar {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                field: *field,
+                value: *value,
+            },
+            Self::SetRootNode { node_id, .. } => Self::SetRootNode {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+            },
         }
     }
 }
@@ -665,6 +755,19 @@ impl WorkspaceTransaction {
         }
         targets
     }
+
+    fn with_reissued_ids(&self, actor: TransactionActor, intent: Option<String>) -> Self {
+        Self {
+            id: TransactionId::new(),
+            actor,
+            intent: normalize_transaction_intent(intent),
+            operations: self
+                .operations
+                .iter()
+                .map(WorkspaceOp::clone_with_new_id)
+                .collect(),
+        }
+    }
 }
 
 /// A concise target summary for a transaction.
@@ -693,13 +796,15 @@ impl AffectedTargets {
 }
 
 /// A committed transaction record emitted by the structured mutation layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceTransactionCommit {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
     operation_ids: Vec<OperationId>,
     affected_targets: AffectedTargets,
+    forward_transaction: WorkspaceTransaction,
+    inverse_transaction: WorkspaceTransaction,
     revision_before: Revision,
     revision_after: Revision,
 }
@@ -730,6 +835,16 @@ impl WorkspaceTransactionCommit {
         &self.affected_targets
     }
 
+    /// Returns the committed forward transaction definition.
+    pub fn forward_transaction(&self) -> &WorkspaceTransaction {
+        &self.forward_transaction
+    }
+
+    /// Returns the generated inverse transaction definition.
+    pub fn inverse_transaction(&self) -> &WorkspaceTransaction {
+        &self.inverse_transaction
+    }
+
     /// Returns the logical workspace revision before the commit.
     pub const fn revision_before(&self) -> Revision {
         self.revision_before
@@ -758,6 +873,90 @@ pub enum WorkspaceTransactionError {
         #[from]
         source: WorkspaceError,
     },
+
+    #[error("workspace transaction cannot be inverted safely: {message}")]
+    NonInvertible { message: String },
+}
+
+/// In-memory undo/redo availability state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UndoRedoAvailability {
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RecordedTransaction {
+    forward: WorkspaceTransaction,
+    inverse: WorkspaceTransaction,
+}
+
+/// In-memory transaction-level undo/redo owner for one workspace session.
+#[derive(Debug, Clone, Default)]
+pub struct UndoRedoManager {
+    undo_stack: Vec<RecordedTransaction>,
+    redo_stack: Vec<RecordedTransaction>,
+}
+
+impl UndoRedoManager {
+    /// Returns whether undo or redo is currently available.
+    pub fn availability(&self) -> UndoRedoAvailability {
+        UndoRedoAvailability {
+            can_undo: !self.undo_stack.is_empty(),
+            can_redo: !self.redo_stack.is_empty(),
+        }
+    }
+
+    /// Clears all in-memory undo/redo history.
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// Records a newly committed forward transaction and clears redo state.
+    pub fn record_commit(&mut self, commit: &WorkspaceTransactionCommit) {
+        self.undo_stack.push(RecordedTransaction {
+            forward: commit.forward_transaction().clone(),
+            inverse: commit.inverse_transaction().clone(),
+        });
+        self.redo_stack.clear();
+    }
+
+    /// Applies one undo as one inverse transaction and moves the record to redo.
+    pub fn undo(
+        &mut self,
+        workspace: &mut Workspace,
+        actor: TransactionActor,
+    ) -> Result<Option<WorkspaceTransactionCommit>, WorkspaceTransactionError> {
+        let Some(record) = self.undo_stack.pop() else {
+            return Ok(None);
+        };
+
+        let commit = workspace.apply_transaction(&record.inverse.with_reissued_ids(
+            actor,
+            Some(undo_intent(record.forward.intent(), record.forward.id())),
+        ))?;
+        self.redo_stack.push(record);
+        Ok(Some(commit))
+    }
+
+    /// Reapplies one undone transaction and returns it to the undo stack.
+    pub fn redo(
+        &mut self,
+        workspace: &mut Workspace,
+        actor: TransactionActor,
+    ) -> Result<Option<WorkspaceTransactionCommit>, WorkspaceTransactionError> {
+        let Some(record) = self.redo_stack.pop() else {
+            return Ok(None);
+        };
+
+        let commit = workspace.apply_transaction(&record.forward.with_reissued_ids(
+            actor,
+            Some(redo_intent(record.forward.intent(), record.forward.id())),
+        ))?;
+        self.undo_stack.push(record);
+        Ok(Some(commit))
+    }
 }
 
 /// An opened Morphos workspace.
@@ -936,8 +1135,11 @@ impl Workspace {
         transaction: &WorkspaceTransaction,
     ) -> Result<WorkspaceTransactionCommit, WorkspaceTransactionError> {
         let mut source = SceneSource::parse(&self.source_text)?;
+        let mut scene = source.validate()?;
+        let mut inverse_operations = Vec::with_capacity(transaction.operations().len());
         for operation in transaction.operations() {
-            operation.apply(&mut source)?;
+            inverse_operations.push(capture_inverse_operation(&scene, operation)?);
+            scene = operation.apply(&mut source)?;
         }
 
         let updated_text = source.into_text();
@@ -948,6 +1150,12 @@ impl Workspace {
             .iter()
             .map(|operation| operation.id().clone())
             .collect();
+        let inverse_transaction = WorkspaceTransaction::new(
+            transaction.actor(),
+            Some(undo_intent(transaction.intent(), transaction.id())),
+            inverse_operations.into_iter().rev().collect(),
+        )
+        .expect("inverse transaction contains operations");
 
         if self.replace_source(updated_text) {
             self.save()?;
@@ -959,6 +1167,8 @@ impl Workspace {
             intent: transaction.intent.clone(),
             operation_ids,
             affected_targets,
+            forward_transaction: transaction.clone(),
+            inverse_transaction,
             revision_before,
             revision_after: self.revision,
         })
@@ -1105,6 +1315,227 @@ fn normalize_transaction_intent(intent: Option<String>) -> Option<String> {
             Some(normalized)
         }
     })
+}
+
+fn undo_intent(intent: Option<&str>, transaction_id: &TransactionId) -> String {
+    match intent {
+        Some(intent) => format!("Undo {intent} ({transaction_id})"),
+        None => format!("Undo transaction {transaction_id}"),
+    }
+}
+
+fn redo_intent(intent: Option<&str>, transaction_id: &TransactionId) -> String {
+    match intent {
+        Some(intent) => format!("Redo {intent} ({transaction_id})"),
+        None => format!("Redo transaction {transaction_id}"),
+    }
+}
+
+fn capture_inverse_operation(
+    scene: &SceneDocument,
+    operation: &WorkspaceOp,
+) -> Result<WorkspaceOp, WorkspaceTransactionError> {
+    match operation {
+        WorkspaceOp::AddNode { node_id, .. } => Ok(WorkspaceOp::DeleteNode {
+            id: OperationId::new(),
+            node_id: node_id.clone(),
+        }),
+        WorkspaceOp::ReplaceNode { node, .. } => {
+            if let Some(previous) = scene.nodes().get(node.id()) {
+                Ok(WorkspaceOp::ReplaceNode {
+                    id: OperationId::new(),
+                    node: Box::new(previous.clone()),
+                })
+            } else {
+                Ok(WorkspaceOp::DeleteNode {
+                    id: OperationId::new(),
+                    node_id: node.id().clone(),
+                })
+            }
+        }
+        WorkspaceOp::DeleteNode { node_id, .. } => {
+            let previous = scene.nodes().get(node_id).ok_or_else(|| {
+                WorkspaceTransactionError::NonInvertible {
+                    message: format!("cannot delete missing node `{node_id}`"),
+                }
+            })?;
+            Ok(WorkspaceOp::ReplaceNode {
+                id: OperationId::new(),
+                node: Box::new(previous.clone()),
+            })
+        }
+        WorkspaceOp::RenameNode { from, to, .. } => Ok(WorkspaceOp::RenameNode {
+            id: OperationId::new(),
+            from: to.clone(),
+            to: from.clone(),
+        }),
+        WorkspaceOp::DuplicateNode { duplicate, .. } => Ok(WorkspaceOp::DeleteNode {
+            id: OperationId::new(),
+            node_id: duplicate.clone(),
+        }),
+        WorkspaceOp::SetNodeLabel { node_id, .. } => {
+            let previous = scene.nodes().get(node_id).ok_or_else(|| {
+                WorkspaceTransactionError::NonInvertible {
+                    message: format!("cannot update missing node `{node_id}`"),
+                }
+            })?;
+            Ok(WorkspaceOp::SetNodeLabel {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                label: previous.label().map(ToOwned::to_owned),
+            })
+        }
+        WorkspaceOp::SetCompositionChildren { node_id, .. } => {
+            let previous = scene.nodes().get(node_id).ok_or_else(|| {
+                WorkspaceTransactionError::NonInvertible {
+                    message: format!("cannot update missing node `{node_id}`"),
+                }
+            })?;
+            let (NodeKind::Union(composition)
+            | NodeKind::Difference(composition)
+            | NodeKind::Intersection(composition)) = previous.kind()
+            else {
+                return Err(WorkspaceTransactionError::NonInvertible {
+                    message: format!("node `{node_id}` is not a composition node"),
+                });
+            };
+            Ok(WorkspaceOp::SetCompositionChildren {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                children: composition
+                    .children
+                    .iter()
+                    .map(|child| child.target().clone())
+                    .collect(),
+            })
+        }
+        WorkspaceOp::SetParameterScalar { parameter_id, .. } => {
+            let previous = scene.parameters().get(parameter_id).ok_or_else(|| {
+                WorkspaceTransactionError::NonInvertible {
+                    message: format!("cannot update missing parameter `{parameter_id}`"),
+                }
+            })?;
+            Ok(WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: parameter_id.clone(),
+                value: previous.scalar_value(),
+            })
+        }
+        WorkspaceOp::SetTransformComponent {
+            node_id,
+            property,
+            axis,
+            ..
+        } => Ok(WorkspaceOp::SetTransformComponent {
+            id: OperationId::new(),
+            node_id: node_id.clone(),
+            property: *property,
+            axis: *axis,
+            value: scalar_expr_literal(
+                transform_component_expr(
+                    scene.nodes().get(node_id).ok_or_else(|| {
+                        WorkspaceTransactionError::NonInvertible {
+                            message: format!("cannot update missing node `{node_id}`"),
+                        }
+                    })?,
+                    *property,
+                    *axis,
+                ),
+                node_id.as_str(),
+            )?,
+        }),
+        WorkspaceOp::SetPrimitiveScalar { node_id, field, .. } => {
+            Ok(WorkspaceOp::SetPrimitiveScalar {
+                id: OperationId::new(),
+                node_id: node_id.clone(),
+                field: *field,
+                value: scalar_expr_literal(
+                    primitive_scalar_expr(
+                        scene.nodes().get(node_id).ok_or_else(|| {
+                            WorkspaceTransactionError::NonInvertible {
+                                message: format!("cannot update missing node `{node_id}`"),
+                            }
+                        })?,
+                        *field,
+                    )?,
+                    node_id.as_str(),
+                )?,
+            })
+        }
+        WorkspaceOp::SetRootNode { .. } => Ok(WorkspaceOp::SetRootNode {
+            id: OperationId::new(),
+            node_id: scene.root().clone(),
+        }),
+    }
+}
+
+fn scalar_expr_literal(
+    expression: &ScalarExpr,
+    context: &str,
+) -> Result<f64, WorkspaceTransactionError> {
+    match expression {
+        ScalarExpr::Literal(value) => Ok(*value),
+        ScalarExpr::Parameter(parameter) => Err(WorkspaceTransactionError::NonInvertible {
+            message: format!(
+                "cannot invert literal edit for `{context}` because it is parameter-driven by `{}`",
+                parameter.target()
+            ),
+        }),
+    }
+}
+
+fn transform_component_expr(node: &Node, property: TransformProperty, axis: Axis) -> &ScalarExpr {
+    let vector = match property {
+        TransformProperty::Translation => &node.transform().translation,
+        TransformProperty::RotationDegrees => &node.transform().rotation_deg,
+        TransformProperty::Scale => &node.transform().scale,
+    };
+    match axis {
+        Axis::X => &vector.x,
+        Axis::Y => &vector.y,
+        Axis::Z => &vector.z,
+    }
+}
+
+fn primitive_scalar_expr(
+    node: &Node,
+    field: PrimitiveScalarField,
+) -> Result<&ScalarExpr, WorkspaceTransactionError> {
+    match (node.kind(), field) {
+        (NodeKind::Box(shape), PrimitiveScalarField::BoxX) => Ok(&shape.size.x),
+        (NodeKind::Box(shape), PrimitiveScalarField::BoxY) => Ok(&shape.size.y),
+        (NodeKind::Box(shape), PrimitiveScalarField::BoxZ) => Ok(&shape.size.z),
+        (NodeKind::Sphere(shape), PrimitiveScalarField::SphereRadius) => Ok(&shape.radius),
+        (NodeKind::Cylinder(shape), PrimitiveScalarField::CylinderRadius) => Ok(&shape.radius),
+        (NodeKind::Cylinder(shape), PrimitiveScalarField::CylinderHeight) => Ok(&shape.height),
+        (NodeKind::Capsule(shape), PrimitiveScalarField::CapsuleRadius) => Ok(&shape.radius),
+        (NodeKind::Capsule(shape), PrimitiveScalarField::CapsuleHeight) => Ok(&shape.height),
+        (NodeKind::Plane(shape), PrimitiveScalarField::PlaneWidth) => Ok(&shape.width),
+        (NodeKind::Plane(shape), PrimitiveScalarField::PlaneDepth) => Ok(&shape.depth),
+        (NodeKind::Profile(shape), PrimitiveScalarField::ProfileWidth) => Ok(&shape.width),
+        (NodeKind::Profile(shape), PrimitiveScalarField::ProfileHeight) => Ok(&shape.height),
+        _ => Err(WorkspaceTransactionError::NonInvertible {
+            message: format!(
+                "field `{field:?}` is not valid for node `{}` of kind `{}`",
+                node.id(),
+                node_kind_name(node.kind())
+            ),
+        }),
+    }
+}
+
+fn node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Box(_) => "box",
+        NodeKind::Sphere(_) => "sphere",
+        NodeKind::Cylinder(_) => "cylinder",
+        NodeKind::Capsule(_) => "capsule",
+        NodeKind::Plane(_) => "plane",
+        NodeKind::Profile(_) => "profile",
+        NodeKind::Union(_) => "union",
+        NodeKind::Difference(_) => "difference",
+        NodeKind::Intersection(_) => "intersection",
+    }
 }
 
 fn normalize_relative_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -1509,6 +1940,11 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
 kind = "sphere"
 radius = 0.5
 transform = { translate = { x = 0.0, y = 1.5, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.spare]
+kind = "sphere"
+radius = 0.25
+transform = { translate = { x = 2.0, y = 0.5, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
 
 [nodes.root]
 kind = "union"
@@ -2000,5 +2436,299 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
         let error = WorkspaceTransaction::new(TransactionActor::SystemMigration, None, vec![])
             .expect_err("empty transaction should fail");
         assert!(matches!(error, WorkspaceTransactionError::EmptyTransaction));
+    }
+
+    #[test]
+    fn single_op_undo_redo_round_trips_parameter_and_rename() {
+        let mut workspace = transaction_workspace();
+        let mut history = UndoRedoManager::default();
+
+        let set_parameter = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Tune width".to_owned()),
+            vec![WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: ParamId::new("width").expect("width"),
+                value: 5.0,
+            }],
+        )
+        .expect("transaction");
+        let parameter_commit = workspace
+            .apply_transaction(&set_parameter)
+            .expect("apply parameter");
+        history.record_commit(&parameter_commit);
+
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert_eq!(
+            scene.parameters()[&ParamId::new("width").expect("width")].scalar_value(),
+            5.0
+        );
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo")
+            .expect("undo commit");
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert_eq!(
+            scene.parameters()[&ParamId::new("width").expect("width")].scalar_value(),
+            3.0
+        );
+
+        history
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo")
+            .expect("redo commit");
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert_eq!(
+            scene.parameters()[&ParamId::new("width").expect("width")].scalar_value(),
+            5.0
+        );
+
+        let rename = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Rename cap".to_owned()),
+            vec![WorkspaceOp::RenameNode {
+                id: OperationId::new(),
+                from: NodeId::new("cap").expect("cap"),
+                to: NodeId::new("top").expect("top"),
+            }],
+        )
+        .expect("transaction");
+        let rename_commit = workspace.apply_transaction(&rename).expect("apply rename");
+        history.record_commit(&rename_commit);
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo rename")
+            .expect("undo commit");
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert!(
+            scene
+                .nodes()
+                .contains_key(&NodeId::new("cap").expect("cap"))
+        );
+        assert!(
+            !scene
+                .nodes()
+                .contains_key(&NodeId::new("top").expect("top"))
+        );
+
+        history
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo rename")
+            .expect("redo commit");
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert!(
+            scene
+                .nodes()
+                .contains_key(&NodeId::new("top").expect("top"))
+        );
+        assert!(
+            !scene
+                .nodes()
+                .contains_key(&NodeId::new("cap").expect("cap"))
+        );
+    }
+
+    #[test]
+    fn multi_operation_transaction_undo_and_redo_restore_exact_states() {
+        let mut workspace = transaction_workspace();
+        let before = geom_scene::parse_scene(workspace.source_text()).expect("before");
+        let mut history = UndoRedoManager::default();
+
+        let transaction = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Rename and retune".to_owned()),
+            vec![
+                WorkspaceOp::RenameNode {
+                    id: OperationId::new(),
+                    from: NodeId::new("cap").expect("cap"),
+                    to: NodeId::new("top").expect("top"),
+                },
+                WorkspaceOp::SetTransformComponent {
+                    id: OperationId::new(),
+                    node_id: NodeId::new("top").expect("top"),
+                    property: TransformProperty::Translation,
+                    axis: Axis::Y,
+                    value: 2.0,
+                },
+                WorkspaceOp::SetCompositionChildren {
+                    id: OperationId::new(),
+                    node_id: NodeId::new("root").expect("root"),
+                    children: vec![
+                        NodeId::new("top").expect("top"),
+                        NodeId::new("body").expect("body"),
+                    ],
+                },
+            ],
+        )
+        .expect("transaction");
+        let commit = workspace
+            .apply_transaction(&transaction)
+            .expect("apply transaction");
+        history.record_commit(&commit);
+        let committed = geom_scene::parse_scene(workspace.source_text()).expect("committed");
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo")
+            .expect("undo commit");
+        let undone = geom_scene::parse_scene(workspace.source_text()).expect("undone");
+        assert_eq!(undone, before);
+
+        history
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo")
+            .expect("redo commit");
+        let redone = geom_scene::parse_scene(workspace.source_text()).expect("redone");
+        assert_eq!(redone, committed);
+    }
+
+    #[test]
+    fn add_delete_undo_redo_restore_exact_nodes() {
+        let mut workspace = transaction_workspace();
+        let mut history = UndoRedoManager::default();
+
+        let add = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Add spare sphere".to_owned()),
+            vec![WorkspaceOp::AddNode {
+                id: OperationId::new(),
+                node_id: NodeId::new("extra").expect("extra"),
+                draft: SceneNodeDraft::Sphere,
+            }],
+        )
+        .expect("transaction");
+        let add_commit = workspace.apply_transaction(&add).expect("apply add");
+        history.record_commit(&add_commit);
+        assert!(
+            geom_scene::parse_scene(workspace.source_text())
+                .expect("parse")
+                .nodes()
+                .contains_key(&NodeId::new("extra").expect("extra"))
+        );
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo add")
+            .expect("undo commit");
+        assert!(
+            !geom_scene::parse_scene(workspace.source_text())
+                .expect("parse")
+                .nodes()
+                .contains_key(&NodeId::new("extra").expect("extra"))
+        );
+
+        history
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo add")
+            .expect("redo commit");
+        assert!(
+            geom_scene::parse_scene(workspace.source_text())
+                .expect("parse")
+                .nodes()
+                .contains_key(&NodeId::new("extra").expect("extra"))
+        );
+
+        let deleted_before = geom_scene::parse_scene(workspace.source_text())
+            .expect("parse")
+            .nodes()[&NodeId::new("spare").expect("spare")]
+            .clone();
+        let delete = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Delete spare".to_owned()),
+            vec![WorkspaceOp::DeleteNode {
+                id: OperationId::new(),
+                node_id: NodeId::new("spare").expect("spare"),
+            }],
+        )
+        .expect("transaction");
+        let delete_commit = workspace.apply_transaction(&delete).expect("apply delete");
+        history.record_commit(&delete_commit);
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo delete")
+            .expect("undo commit");
+        let restored = geom_scene::parse_scene(workspace.source_text()).expect("parse");
+        assert_eq!(
+            restored.nodes()[&NodeId::new("spare").expect("spare")],
+            deleted_before
+        );
+
+        history
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo delete")
+            .expect("redo commit");
+        assert!(
+            !geom_scene::parse_scene(workspace.source_text())
+                .expect("parse")
+                .nodes()
+                .contains_key(&NodeId::new("spare").expect("spare"))
+        );
+    }
+
+    #[test]
+    fn redo_is_cleared_by_new_commit_after_undo() {
+        let mut workspace = transaction_workspace();
+        let mut history = UndoRedoManager::default();
+
+        let commit_a = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("A".to_owned()),
+                    vec![WorkspaceOp::SetParameterScalar {
+                        id: OperationId::new(),
+                        parameter_id: ParamId::new("width").expect("width"),
+                        value: 4.0,
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply A");
+        history.record_commit(&commit_a);
+
+        let commit_b = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("B".to_owned()),
+                    vec![WorkspaceOp::SetTransformComponent {
+                        id: OperationId::new(),
+                        node_id: NodeId::new("body").expect("body"),
+                        property: TransformProperty::Translation,
+                        axis: Axis::X,
+                        value: 2.0,
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply B");
+        history.record_commit(&commit_b);
+
+        history
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo B")
+            .expect("undo commit");
+        assert!(history.availability().can_redo);
+
+        let commit_c = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("C".to_owned()),
+                    vec![WorkspaceOp::SetNodeLabel {
+                        id: OperationId::new(),
+                        node_id: NodeId::new("body").expect("body"),
+                        label: Some("Retagged".to_owned()),
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply C");
+        history.record_commit(&commit_c);
+
+        assert!(!history.availability().can_redo);
     }
 }

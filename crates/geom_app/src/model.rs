@@ -8,12 +8,12 @@ use crate::viewport::DisplayGeometryRevision;
 use bevy::prelude::Resource;
 use geom_geometry::{BoolmeshBackend, Bounds, GeometryEvaluator};
 use geom_scene::{
-    Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SceneSource,
-    SourceLocation, TransformProperty,
+    Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SourceLocation,
+    TransformProperty,
 };
 use geom_workspace::{
-    OperationId, Revision, TransactionActor, Workspace, WorkspaceError, WorkspaceOp,
-    WorkspaceSummary, WorkspaceTransaction, WorkspaceTransactionError,
+    OperationId, Revision, TransactionActor, UndoRedoAvailability, UndoRedoManager, Workspace,
+    WorkspaceError, WorkspaceOp, WorkspaceSummary, WorkspaceTransaction, WorkspaceTransactionError,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -34,6 +34,7 @@ pub struct AppModel {
     displayed_geometry: Option<DisplayedGeometry>,
     build_status: AppBuildStatus,
     reactive: ReactiveController,
+    undo_redo: UndoRedoManager,
 }
 
 impl AppModel {
@@ -45,6 +46,7 @@ impl AppModel {
             displayed_geometry: None,
             build_status: AppBuildStatus::NoWorkspace,
             reactive: ReactiveController::new(),
+            undo_redo: UndoRedoManager::default(),
         }
     }
 
@@ -85,6 +87,7 @@ impl AppModel {
         self.last_good_scene = None;
         self.displayed_geometry = None;
         self.build_status = AppBuildStatus::NoWorkspace;
+        self.undo_redo.clear();
         Ok(self
             .reactive
             .begin_session(workspace.source_text(), EditOrigin::StartupReopen, now))
@@ -109,6 +112,7 @@ impl AppModel {
                 now,
             )
         {
+            self.undo_redo.clear();
             return Ok(snapshot);
         }
 
@@ -146,11 +150,16 @@ impl AppModel {
             return Ok(None);
         }
 
+        self.undo_redo.clear();
         Ok(self.reactive.accept_external_source_reload(
             workspace.source_text(),
             EditOrigin::ExternalFile,
             now,
         ))
+    }
+
+    pub fn undo_redo_availability(&self) -> UndoRedoAvailability {
+        self.undo_redo.availability()
     }
 
     pub fn apply_parameter_scalar_delta(
@@ -447,14 +456,30 @@ impl AppModel {
 
     pub fn node_source_location(&self, node: &NodeId) -> Option<SourceLocation> {
         let workspace = self.workspace.as_ref()?;
-        let source = SceneSource::parse(workspace.source_text()).ok()?;
+        let source = geom_scene::SceneSource::parse(workspace.source_text()).ok()?;
         source.node_source_location(node)
     }
 
     pub fn parameter_source_location(&self, parameter: &ParamId) -> Option<SourceLocation> {
         let workspace = self.workspace.as_ref()?;
-        let source = SceneSource::parse(workspace.source_text()).ok()?;
+        let source = geom_scene::SceneSource::parse(workspace.source_text()).ok()?;
         source.parameter_source_location(parameter)
+    }
+
+    pub fn undo(
+        &mut self,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_undo_redo(origin, now, true)
+    }
+
+    pub fn redo(
+        &mut self,
+        origin: EditOrigin,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_undo_redo(origin, now, false)
     }
 
     pub fn accept_build_outcome(&mut self, outcome: BuildOutcome) -> BuildApplicationAction {
@@ -690,12 +715,68 @@ impl AppModel {
         }
 
         let revision_before = workspace.revision();
-        let _commit = workspace
+        let commit = workspace
             .apply_transaction(transaction)
             .map_err(AppEditError::Transaction)?;
         if workspace.revision() == revision_before {
             return Ok(None);
         }
+        self.undo_redo.record_commit(&commit);
+
+        Ok(Some(self.reactive.accept_internal_source_write(
+            workspace.source_text(),
+            origin,
+            now,
+        )))
+    }
+
+    fn apply_undo_redo(
+        &mut self,
+        origin: EditOrigin,
+        now: Instant,
+        is_undo: bool,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        if let Some(reason) = self.editing_disabled_reason() {
+            return Err(AppEditError::Conflict(reason.to_owned()));
+        }
+
+        let base_fingerprint = self
+            .reactive
+            .current_source_fingerprint()
+            .ok_or_else(|| AppEditError::Conflict("no current source fingerprint".to_owned()))?;
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+
+        let disk_source =
+            fs::read_to_string(workspace.paths().source_file()).map_err(|source| {
+                AppEditError::Workspace(WorkspaceError::Io {
+                    path: workspace.paths().source_file(),
+                    operation: "read current source for conflict check",
+                    source,
+                })
+            })?;
+        if SourceFingerprint::from_text(&disk_source) != base_fingerprint {
+            let message =
+                "external source changed since the GUI edit base; retry against the newest source"
+                    .to_owned();
+            self.build_status = AppBuildStatus::Conflict(message.clone());
+            return Err(AppEditError::Conflict(message));
+        }
+
+        let commit = if is_undo {
+            self.undo_redo
+                .undo(workspace, transaction_actor_for_origin(origin))
+        } else {
+            self.undo_redo
+                .redo(workspace, transaction_actor_for_origin(origin))
+        }
+        .map_err(AppEditError::Transaction)?;
+
+        let Some(_commit) = commit else {
+            return Ok(None);
+        };
 
         Ok(Some(self.reactive.accept_internal_source_write(
             workspace.source_text(),
