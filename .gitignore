@@ -1,1 +1,16 @@
-/target
+/target/
+/tmp/
+
+# Morphos-generated artifacts
+/exports/
+/cache/
+
+# Rust and toolchain artifacts
+**/*.rs.bk
+
+# Editor and local environment files
+.DS_Store
+.idea/
+.vscode/
+.zed/
+*.code-workspace
