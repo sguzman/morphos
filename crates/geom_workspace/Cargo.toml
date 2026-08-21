@@ -9,6 +9,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+geom_scene = { path = "../geom_scene" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "0.9"

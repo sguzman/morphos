@@ -14,21 +14,21 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 
 ### Operation model
 
-- [ ] Define project-owned `WorkspaceOp` variants for core scene mutations.
+- [x] Define project-owned `WorkspaceOp` variants for core scene mutations.
 - [ ] Include operations for add/delete/replace node.
-- [ ] Include operations for rename/reparent/reference changes.
-- [ ] Include operations for parameter and transform changes.
+- [x] Include operations for rename/reparent/reference changes.
+- [x] Include operations for parameter and transform changes.
 - [ ] Include operations for workspace metadata changes where appropriate.
-- [ ] Give every operation a stable operation ID.
+- [x] Give every operation a stable operation ID.
 
 ### Transactions
 
-- [ ] Allow multiple operations to be grouped into one transaction.
-- [ ] Validate a transaction before mutating canonical workspace state.
-- [ ] Apply transactions atomically from the perspective of observers.
-- [ ] Emit one coherent revision/event record per committed transaction.
-- [ ] Record transaction actor: user, AI, CLI/automation, or system/migration.
-- [ ] Add optional human-readable transaction intent/summary.
+- [x] Allow multiple operations to be grouped into one transaction.
+- [x] Validate a transaction before mutating canonical workspace state.
+- [x] Apply transactions atomically from the perspective of observers.
+- [x] Emit one coherent revision/event record per committed transaction.
+- [x] Record transaction actor: user, AI, CLI/automation, or system/migration.
+- [x] Add optional human-readable transaction intent/summary.
 
 ### Undo/redo
 
@@ -50,17 +50,25 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 
 - [ ] Produce a structured before/after diff for a transaction.
 - [ ] Produce concise human-readable summaries from structured diffs.
-- [ ] Expose affected node IDs and parameter paths.
+- [x] Expose affected node IDs and parameter paths.
 - [ ] Support comparing current state to a snapshot/revision.
 
 ### Tests
 
-- [ ] Add operation application tests.
-- [ ] Add transaction atomicity tests.
+- [x] Add operation application tests.
+- [x] Add transaction atomicity tests.
 - [ ] Add undo/redo round-trip tests.
 - [ ] Add actor/provenance persistence tests.
 - [ ] Add snapshot restore tests.
 - [ ] Add structured diff tests.
+
+## Notes
+
+- This tranche establishes the transaction foundation only. It intentionally stops before undo,
+  redo, persistent history, snapshots, and rich structured diffs.
+- The current operation surface matches the M06 authoring mutations. A full node-replacement
+  operation and workspace-metadata transaction operations remain future work if they become
+  necessary.
 
 ## Completion criteria
 

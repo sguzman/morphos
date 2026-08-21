@@ -11,7 +11,10 @@ use geom_scene::{
     Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SceneSource,
     SourceLocation, TransformProperty,
 };
-use geom_workspace::{Revision, Workspace, WorkspaceError, WorkspaceSummary};
+use geom_workspace::{
+    OperationId, Revision, TransactionActor, Workspace, WorkspaceError, WorkspaceOp,
+    WorkspaceSummary, WorkspaceTransaction, WorkspaceTransactionError,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -157,31 +160,6 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        let base_fingerprint = self
-            .reactive
-            .current_source_fingerprint()
-            .ok_or_else(|| AppEditError::Conflict("no current source fingerprint".to_owned()))?;
-        let Some(workspace) = self.workspace.as_mut() else {
-            self.build_status = AppBuildStatus::NoWorkspace;
-            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
-        };
-
-        let disk_source =
-            fs::read_to_string(workspace.paths().source_file()).map_err(|source| {
-                AppEditError::Workspace(WorkspaceError::Io {
-                    path: workspace.paths().source_file(),
-                    operation: "read current source for conflict check",
-                    source,
-                })
-            })?;
-        if SourceFingerprint::from_text(&disk_source) != base_fingerprint {
-            let message =
-                "external source changed since the GUI edit base; retry against the newest source"
-                    .to_owned();
-            self.build_status = AppBuildStatus::Conflict(message.clone());
-            return Err(AppEditError::Conflict(message));
-        }
-
         let current_value = self
             .last_good_scene
             .as_ref()
@@ -191,9 +169,17 @@ impl AppModel {
                 AppEditError::Conflict("parameter is unavailable for editing".to_owned())
             })?;
 
-        self.apply_scene_edit(origin, now, |source| {
-            source.set_parameter_scalar(parameter, current_value + delta)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Adjust parameter {}", parameter.as_str())),
+            vec![WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: parameter.clone(),
+                value: current_value + delta,
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn set_parameter_scalar_value(
@@ -203,9 +189,17 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| {
-            source.set_parameter_scalar(parameter, value)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Set parameter {}", parameter.as_str())),
+            vec![WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: parameter.clone(),
+                value,
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn parameter_scalar(&self, parameter: &str) -> Option<f64> {
@@ -274,9 +268,19 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| {
-            source.set_transform_component(node, property, axis, value)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Set {} {:?} {:?}", node.as_str(), property, axis)),
+            vec![WorkspaceOp::SetTransformComponent {
+                id: OperationId::new(),
+                node_id: node.clone(),
+                property,
+                axis,
+                value,
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn set_selected_node_primitive_literal(
@@ -287,9 +291,18 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| {
-            source.set_primitive_scalar(node, field, value)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Set primitive field on {}", node.as_str())),
+            vec![WorkspaceOp::SetPrimitiveScalar {
+                id: OperationId::new(),
+                node_id: node.clone(),
+                field,
+                value,
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn set_node_label(
@@ -299,7 +312,17 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.set_node_label(node, label))
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Set label on {}", node.as_str())),
+            vec![WorkspaceOp::SetNodeLabel {
+                id: OperationId::new(),
+                node_id: node.clone(),
+                label: label.map(ToOwned::to_owned),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn rename_node(
@@ -309,7 +332,17 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.rename_node(from, to))
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Rename {} to {}", from.as_str(), to.as_str())),
+            vec![WorkspaceOp::RenameNode {
+                id: OperationId::new(),
+                from: from.clone(),
+                to: to.clone(),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn duplicate_node(
@@ -319,9 +352,21 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| {
-            source.duplicate_node(source_node, duplicate)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!(
+                "Duplicate {} to {}",
+                source_node.as_str(),
+                duplicate.as_str()
+            )),
+            vec![WorkspaceOp::DuplicateNode {
+                id: OperationId::new(),
+                source_node: source_node.clone(),
+                duplicate: duplicate.clone(),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn add_node(
@@ -331,7 +376,17 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.add_node(node, draft.clone()))
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Add node {}", node.as_str())),
+            vec![WorkspaceOp::AddNode {
+                id: OperationId::new(),
+                node_id: node.clone(),
+                draft,
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn set_root_node(
@@ -340,7 +395,16 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.set_root_node(node))
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Set root to {}", node.as_str())),
+            vec![WorkspaceOp::SetRootNode {
+                id: OperationId::new(),
+                node_id: node.clone(),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn set_composition_children(
@@ -350,9 +414,17 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| {
-            source.set_composition_children(node, children)
-        })
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Update composition children for {}", node.as_str())),
+            vec![WorkspaceOp::SetCompositionChildren {
+                id: OperationId::new(),
+                node_id: node.clone(),
+                children: children.to_vec(),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn delete_node(
@@ -361,7 +433,16 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.delete_node(node))
+        let transaction = WorkspaceTransaction::new(
+            transaction_actor_for_origin(origin),
+            Some(format!("Delete node {}", node.as_str())),
+            vec![WorkspaceOp::DeleteNode {
+                id: OperationId::new(),
+                node_id: node.clone(),
+            }],
+        )
+        .expect("single operation transaction");
+        self.apply_workspace_transaction(origin, now, &transaction)
     }
 
     pub fn node_source_location(&self, node: &NodeId) -> Option<SourceLocation> {
@@ -573,15 +654,12 @@ impl AppModel {
         Ok(())
     }
 
-    fn apply_scene_edit<F>(
+    fn apply_workspace_transaction(
         &mut self,
         origin: EditOrigin,
         now: Instant,
-        edit: F,
-    ) -> Result<Option<BuildRequestSnapshot>, AppEditError>
-    where
-        F: FnOnce(&mut SceneSource) -> Result<SceneDocument, geom_scene::SceneError>,
-    {
+        transaction: &WorkspaceTransaction,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
         if let Some(reason) = self.editing_disabled_reason() {
             return Err(AppEditError::Conflict(reason.to_owned()));
         }
@@ -611,16 +689,16 @@ impl AppModel {
             return Err(AppEditError::Conflict(message));
         }
 
-        let mut source =
-            SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
-        edit(&mut source).map_err(AppEditError::Scene)?;
-        let updated_text = source.into_text();
-        if !workspace.replace_source(updated_text.clone()) {
+        let revision_before = workspace.revision();
+        let _commit = workspace
+            .apply_transaction(transaction)
+            .map_err(AppEditError::Transaction)?;
+        if workspace.revision() == revision_before {
             return Ok(None);
         }
-        workspace.save().map_err(AppEditError::Workspace)?;
+
         Ok(Some(self.reactive.accept_internal_source_write(
-            &updated_text,
+            workspace.source_text(),
             origin,
             now,
         )))
@@ -770,6 +848,7 @@ impl BuildApplicationAction {
 pub enum AppEditError {
     Workspace(WorkspaceError),
     Scene(geom_scene::SceneError),
+    Transaction(WorkspaceTransactionError),
     Conflict(String),
 }
 
@@ -777,4 +856,14 @@ pub enum AppEditError {
 pub enum WorkspaceBuildError {
     NoWorkspacePath,
     Workspace(WorkspaceError),
+}
+
+fn transaction_actor_for_origin(origin: EditOrigin) -> TransactionActor {
+    match origin {
+        EditOrigin::Gui => TransactionActor::User,
+        EditOrigin::Programmatic => TransactionActor::CliAutomation,
+        EditOrigin::StartupReopen | EditOrigin::ExternalFile | EditOrigin::ManualReload => {
+            TransactionActor::SystemMigration
+        }
+    }
 }

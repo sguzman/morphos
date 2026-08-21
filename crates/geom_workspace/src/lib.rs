@@ -37,7 +37,12 @@
 //! is restored before promoting a temp file, and a valid temp file is promoted
 //! only when no backup is available.
 
+use geom_scene::{
+    Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SceneSource,
+    TransformProperty,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -404,6 +409,357 @@ pub enum WorkspaceError {
     },
 }
 
+/// Stable transaction identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TransactionId(Uuid);
+
+impl TransactionId {
+    /// Creates a new transaction ID.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TransactionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TransactionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Stable operation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationId(Uuid);
+
+impl OperationId {
+    /// Creates a new operation ID.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for OperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The actor responsible for a structured workspace transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransactionActor {
+    User,
+    Ai,
+    CliAutomation,
+    SystemMigration,
+}
+
+/// A typed semantic workspace operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceOp {
+    AddNode {
+        id: OperationId,
+        node_id: NodeId,
+        draft: SceneNodeDraft,
+    },
+    DeleteNode {
+        id: OperationId,
+        node_id: NodeId,
+    },
+    RenameNode {
+        id: OperationId,
+        from: NodeId,
+        to: NodeId,
+    },
+    DuplicateNode {
+        id: OperationId,
+        source_node: NodeId,
+        duplicate: NodeId,
+    },
+    SetNodeLabel {
+        id: OperationId,
+        node_id: NodeId,
+        label: Option<String>,
+    },
+    SetCompositionChildren {
+        id: OperationId,
+        node_id: NodeId,
+        children: Vec<NodeId>,
+    },
+    SetParameterScalar {
+        id: OperationId,
+        parameter_id: ParamId,
+        value: f64,
+    },
+    SetTransformComponent {
+        id: OperationId,
+        node_id: NodeId,
+        property: TransformProperty,
+        axis: Axis,
+        value: f64,
+    },
+    SetPrimitiveScalar {
+        id: OperationId,
+        node_id: NodeId,
+        field: PrimitiveScalarField,
+        value: f64,
+    },
+    SetRootNode {
+        id: OperationId,
+        node_id: NodeId,
+    },
+}
+
+impl WorkspaceOp {
+    /// Returns the stable operation ID.
+    pub fn id(&self) -> &OperationId {
+        match self {
+            Self::AddNode { id, .. }
+            | Self::DeleteNode { id, .. }
+            | Self::RenameNode { id, .. }
+            | Self::DuplicateNode { id, .. }
+            | Self::SetNodeLabel { id, .. }
+            | Self::SetCompositionChildren { id, .. }
+            | Self::SetParameterScalar { id, .. }
+            | Self::SetTransformComponent { id, .. }
+            | Self::SetPrimitiveScalar { id, .. }
+            | Self::SetRootNode { id, .. } => id,
+        }
+    }
+
+    /// Returns the canonical mutation targets affected by this operation.
+    pub fn affected_targets(&self) -> AffectedTargets {
+        let mut targets = AffectedTargets::default();
+        match self {
+            Self::AddNode { node_id, .. }
+            | Self::DeleteNode { node_id, .. }
+            | Self::SetNodeLabel { node_id, .. }
+            | Self::SetCompositionChildren { node_id, .. }
+            | Self::SetTransformComponent { node_id, .. }
+            | Self::SetPrimitiveScalar { node_id, .. }
+            | Self::SetRootNode { node_id, .. } => {
+                targets.node_ids.insert(node_id.clone());
+            }
+            Self::RenameNode { from, to, .. } => {
+                targets.node_ids.insert(from.clone());
+                targets.node_ids.insert(to.clone());
+            }
+            Self::DuplicateNode {
+                source_node,
+                duplicate,
+                ..
+            } => {
+                targets.node_ids.insert(source_node.clone());
+                targets.node_ids.insert(duplicate.clone());
+            }
+            Self::SetParameterScalar { parameter_id, .. } => {
+                targets.parameter_ids.insert(parameter_id.clone());
+            }
+        }
+        targets
+    }
+
+    fn apply(&self, source: &mut SceneSource) -> Result<SceneDocument, geom_scene::SceneError> {
+        match self {
+            Self::AddNode { node_id, draft, .. } => source.add_node(node_id, draft.clone()),
+            Self::DeleteNode { node_id, .. } => source.delete_node(node_id),
+            Self::RenameNode { from, to, .. } => source.rename_node(from, to),
+            Self::DuplicateNode {
+                source_node,
+                duplicate,
+                ..
+            } => source.duplicate_node(source_node, duplicate),
+            Self::SetNodeLabel { node_id, label, .. } => {
+                source.set_node_label(node_id, label.as_deref())
+            }
+            Self::SetCompositionChildren {
+                node_id, children, ..
+            } => source.set_composition_children(node_id, children),
+            Self::SetParameterScalar {
+                parameter_id,
+                value,
+                ..
+            } => source.set_parameter_scalar(parameter_id, *value),
+            Self::SetTransformComponent {
+                node_id,
+                property,
+                axis,
+                value,
+                ..
+            } => source.set_transform_component(node_id, *property, *axis, *value),
+            Self::SetPrimitiveScalar {
+                node_id,
+                field,
+                value,
+                ..
+            } => source.set_primitive_scalar(node_id, *field, *value),
+            Self::SetRootNode { node_id, .. } => source.set_root_node(node_id),
+        }
+    }
+}
+
+/// One atomic structured workspace transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceTransaction {
+    id: TransactionId,
+    actor: TransactionActor,
+    intent: Option<String>,
+    operations: Vec<WorkspaceOp>,
+}
+
+impl WorkspaceTransaction {
+    /// Creates a new transaction with the provided actor and operations.
+    pub fn new(
+        actor: TransactionActor,
+        intent: Option<String>,
+        operations: Vec<WorkspaceOp>,
+    ) -> Result<Self, WorkspaceTransactionError> {
+        if operations.is_empty() {
+            return Err(WorkspaceTransactionError::EmptyTransaction);
+        }
+        Ok(Self {
+            id: TransactionId::new(),
+            actor,
+            intent: normalize_transaction_intent(intent),
+            operations,
+        })
+    }
+
+    /// Returns the stable transaction ID.
+    pub fn id(&self) -> &TransactionId {
+        &self.id
+    }
+
+    /// Returns the actor responsible for this transaction.
+    pub const fn actor(&self) -> TransactionActor {
+        self.actor
+    }
+
+    /// Returns the optional human-readable intent/summary.
+    pub fn intent(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+
+    /// Returns the ordered operations in this transaction.
+    pub fn operations(&self) -> &[WorkspaceOp] {
+        &self.operations
+    }
+
+    /// Returns the union of affected node and parameter targets.
+    pub fn affected_targets(&self) -> AffectedTargets {
+        let mut targets = AffectedTargets::default();
+        for operation in &self.operations {
+            targets.extend(&operation.affected_targets());
+        }
+        targets
+    }
+}
+
+/// A concise target summary for a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AffectedTargets {
+    node_ids: BTreeSet<NodeId>,
+    parameter_ids: BTreeSet<ParamId>,
+}
+
+impl AffectedTargets {
+    /// Returns the affected node IDs.
+    pub fn node_ids(&self) -> &BTreeSet<NodeId> {
+        &self.node_ids
+    }
+
+    /// Returns the affected parameter IDs.
+    pub fn parameter_ids(&self) -> &BTreeSet<ParamId> {
+        &self.parameter_ids
+    }
+
+    fn extend(&mut self, other: &AffectedTargets) {
+        self.node_ids.extend(other.node_ids.iter().cloned());
+        self.parameter_ids
+            .extend(other.parameter_ids.iter().cloned());
+    }
+}
+
+/// A committed transaction record emitted by the structured mutation layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTransactionCommit {
+    transaction_id: TransactionId,
+    actor: TransactionActor,
+    intent: Option<String>,
+    operation_ids: Vec<OperationId>,
+    affected_targets: AffectedTargets,
+    revision_before: Revision,
+    revision_after: Revision,
+}
+
+impl WorkspaceTransactionCommit {
+    /// Returns the committed transaction ID.
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
+    /// Returns the transaction actor.
+    pub const fn actor(&self) -> TransactionActor {
+        self.actor
+    }
+
+    /// Returns the optional human-readable transaction intent.
+    pub fn intent(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+
+    /// Returns the stable operation IDs committed by this transaction.
+    pub fn operation_ids(&self) -> &[OperationId] {
+        &self.operation_ids
+    }
+
+    /// Returns the union of affected mutation targets.
+    pub fn affected_targets(&self) -> &AffectedTargets {
+        &self.affected_targets
+    }
+
+    /// Returns the logical workspace revision before the commit.
+    pub const fn revision_before(&self) -> Revision {
+        self.revision_before
+    }
+
+    /// Returns the logical workspace revision after the commit.
+    pub const fn revision_after(&self) -> Revision {
+        self.revision_after
+    }
+}
+
+/// Structured transaction-layer failures.
+#[derive(Debug, Error)]
+pub enum WorkspaceTransactionError {
+    #[error("workspace transaction requires at least one operation")]
+    EmptyTransaction,
+
+    #[error("structured workspace transaction failed during validation: {source}")]
+    SceneValidation {
+        #[from]
+        source: geom_scene::SceneError,
+    },
+
+    #[error("workspace transaction failed during persistence: {source}")]
+    Workspace {
+        #[from]
+        source: WorkspaceError,
+    },
+}
+
 /// An opened Morphos workspace.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -571,6 +927,43 @@ impl Workspace {
         Ok(())
     }
 
+    /// Validates and applies one structured transaction atomically.
+    ///
+    /// The transaction is validated against a temporary `SceneSource` first. No
+    /// canonical workspace mutation occurs unless every operation succeeds.
+    pub fn apply_transaction(
+        &mut self,
+        transaction: &WorkspaceTransaction,
+    ) -> Result<WorkspaceTransactionCommit, WorkspaceTransactionError> {
+        let mut source = SceneSource::parse(&self.source_text)?;
+        for operation in transaction.operations() {
+            operation.apply(&mut source)?;
+        }
+
+        let updated_text = source.into_text();
+        let revision_before = self.revision;
+        let affected_targets = transaction.affected_targets();
+        let operation_ids = transaction
+            .operations()
+            .iter()
+            .map(|operation| operation.id().clone())
+            .collect();
+
+        if self.replace_source(updated_text) {
+            self.save()?;
+        }
+
+        Ok(WorkspaceTransactionCommit {
+            transaction_id: transaction.id().clone(),
+            actor: transaction.actor(),
+            intent: transaction.intent.clone(),
+            operation_ids,
+            affected_targets,
+            revision_before,
+            revision_after: self.revision,
+        })
+    }
+
     /// Returns ordered change sets recorded after the supplied revision.
     pub fn changes_since(
         &self,
@@ -695,6 +1088,17 @@ fn normalize_name(name: String) -> Result<String, WorkspaceError> {
 fn normalize_description(description: Option<String>) -> Option<String> {
     description.and_then(|description| {
         let normalized = description.trim().to_owned();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
+}
+
+fn normalize_transaction_intent(intent: Option<String>) -> Option<String> {
+    intent.and_then(|intent| {
+        let normalized = intent.trim().to_owned();
         if normalized.is_empty() {
             None
         } else {
@@ -1087,6 +1491,45 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const TRANSACTION_SOURCE: &str = r#"
+schema_version = 1
+root = "root"
+
+[params.width]
+type = "scalar"
+value = 3.0
+
+[nodes.body]
+kind = "box"
+label = "Body"
+size = { x = { param = "width" }, y = 2.0, z = 1.0 }
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.cap]
+kind = "sphere"
+radius = 0.5
+transform = { translate = { x = 0.0, y = 1.5, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.root]
+kind = "union"
+children = ["body", "cap"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#;
+
+    fn transaction_workspace() -> Workspace {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = temp_dir.path().join("transaction-workspace");
+        std::mem::forget(temp_dir);
+        let mut workspace = create_workspace(
+            &workspace_root,
+            CreateWorkspaceOptions::new("Transaction Workspace"),
+        )
+        .expect("create workspace");
+        workspace.replace_source(TRANSACTION_SOURCE);
+        workspace.save().expect("save source");
+        Workspace::open(&workspace_root).expect("reopen workspace")
+    }
+
     #[test]
     fn create_save_reopen_round_trip_preserves_identity_and_state() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1425,5 +1868,137 @@ mod tests {
         assert!(!backup_path_for(&workspace.paths().metadata_file()).exists());
         assert!(!temp_path_for(&workspace.paths().source_file()).exists());
         assert!(!backup_path_for(&workspace.paths().source_file()).exists());
+    }
+
+    #[test]
+    fn transaction_applies_multiple_operations_and_reports_actor_intent_and_targets() {
+        let mut workspace = transaction_workspace();
+        let body = NodeId::new("body").expect("body");
+        let width = ParamId::new("width").expect("width");
+        let transaction = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Broaden body and move it".to_owned()),
+            vec![
+                WorkspaceOp::SetParameterScalar {
+                    id: OperationId::new(),
+                    parameter_id: width.clone(),
+                    value: 4.25,
+                },
+                WorkspaceOp::SetTransformComponent {
+                    id: OperationId::new(),
+                    node_id: body.clone(),
+                    property: TransformProperty::Translation,
+                    axis: Axis::X,
+                    value: 1.5,
+                },
+            ],
+        )
+        .expect("transaction");
+
+        let commit = workspace
+            .apply_transaction(&transaction)
+            .expect("apply transaction");
+        assert_eq!(commit.actor(), TransactionActor::User);
+        assert_eq!(commit.intent(), Some("Broaden body and move it"));
+        assert_eq!(commit.operation_ids().len(), 2);
+        assert!(commit.affected_targets().node_ids().contains(&body));
+        assert!(commit.affected_targets().parameter_ids().contains(&width));
+        assert!(commit.revision_after().get() > commit.revision_before().get());
+
+        let reopened = Workspace::open(workspace.root()).expect("reopen");
+        let scene = geom_scene::parse_scene(reopened.source_text()).expect("parse scene");
+        assert_eq!(scene.parameters()[&width].scalar_value(), 4.25);
+        match &scene.nodes()[&body].transform().translation.x {
+            geom_scene::ScalarExpr::Literal(value) => assert_eq!(*value, 1.5),
+            other => panic!("unexpected translation value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_transaction_fails_atomically_without_partial_source_mutation() {
+        let mut workspace = transaction_workspace();
+        let original_source = workspace.source_text().to_owned();
+        let transaction = WorkspaceTransaction::new(
+            TransactionActor::CliAutomation,
+            Some("Partial failure should not persist".to_owned()),
+            vec![
+                WorkspaceOp::SetParameterScalar {
+                    id: OperationId::new(),
+                    parameter_id: ParamId::new("width").expect("width"),
+                    value: 9.0,
+                },
+                WorkspaceOp::RenameNode {
+                    id: OperationId::new(),
+                    from: NodeId::new("body").expect("body"),
+                    to: NodeId::new("root").expect("root"),
+                },
+            ],
+        )
+        .expect("transaction");
+
+        let error = workspace
+            .apply_transaction(&transaction)
+            .expect_err("transaction should fail");
+        assert!(matches!(
+            error,
+            WorkspaceTransactionError::SceneValidation { .. }
+        ));
+        assert_eq!(workspace.source_text(), original_source);
+
+        let reopened = Workspace::open(workspace.root()).expect("reopen");
+        assert_eq!(reopened.source_text(), original_source);
+        let scene = geom_scene::parse_scene(reopened.source_text()).expect("parse scene");
+        assert_eq!(
+            scene.parameters()[&ParamId::new("width").expect("width")].scalar_value(),
+            3.0
+        );
+        assert!(
+            scene
+                .nodes()
+                .contains_key(&NodeId::new("body").expect("body"))
+        );
+    }
+
+    #[test]
+    fn rename_transaction_updates_references_coherently() {
+        let mut workspace = transaction_workspace();
+        let transaction = WorkspaceTransaction::new(
+            TransactionActor::Ai,
+            Some("Rename cap to top".to_owned()),
+            vec![WorkspaceOp::RenameNode {
+                id: OperationId::new(),
+                from: NodeId::new("cap").expect("cap"),
+                to: NodeId::new("top").expect("top"),
+            }],
+        )
+        .expect("transaction");
+
+        workspace
+            .apply_transaction(&transaction)
+            .expect("apply rename");
+        let scene = geom_scene::parse_scene(workspace.source_text()).expect("parse scene");
+        assert!(
+            scene
+                .nodes()
+                .contains_key(&NodeId::new("top").expect("top"))
+        );
+        assert!(
+            !scene
+                .nodes()
+                .contains_key(&NodeId::new("cap").expect("cap"))
+        );
+        match scene.nodes()[&NodeId::new("root").expect("root")].kind() {
+            geom_scene::NodeKind::Union(composition) => {
+                assert_eq!(composition.children[1].target().as_str(), "top");
+            }
+            other => panic!("unexpected root kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_transaction_is_rejected() {
+        let error = WorkspaceTransaction::new(TransactionActor::SystemMigration, None, vec![])
+            .expect_err("empty transaction should fail");
+        assert!(matches!(error, WorkspaceTransactionError::EmptyTransaction));
     }
 }

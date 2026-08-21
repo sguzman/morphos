@@ -17,9 +17,11 @@ bounds, and statistics results through a backend-neutral geometry API with selec
 and dependency-aware caching; launch the first desktop viewport shell through `geom_app`; and
 reactively rebuild the viewport from external or in-app source edits through a watched
 `source/scene.toml` loop with last-good preview preservation, stale-result suppression, and
-timing instrumentation; and directly author the current scene schema through a scene tree,
-inspector, parameter controls, and basic structural editing while TOML remains canonical. CLI
-product commands and AI integration remain future work.
+timing instrumentation; directly author the current scene schema through a scene tree, inspector,
+parameter controls, and basic structural editing while TOML remains canonical; and route current
+scene mutations through a structured workspace-transaction foundation with typed operations,
+atomic validation/apply behavior, actor metadata, and affected-target reporting. Undo/history,
+CLI product commands, and AI integration remain future work.
 
 ## Architecture invariants
 
@@ -52,6 +54,8 @@ product commands and AI integration remain future work.
   suppression, timing harness, and reactive verification procedure.
 - `docs/authoring-ui.md`: the M06 scene-tree, inspector, parameter, structural-editing, and
   invalid-source authoring behavior.
+- `docs/workspace-transactions.md`: the M07 transaction foundation, actor model, atomic apply
+  behavior, and GUI integration boundary.
 - `milestones/`: canonical milestone files and milestone index.
 - `.github/workflows/ci.yml`: baseline continuous integration workflow.
 - `tmp/`: local reference material only; intentionally ignored and never canonical.

@@ -1383,6 +1383,9 @@ fn process_app_commands_system(
                 Err(AppEditError::Scene(error)) => {
                     error!("scene edit failed: {error}");
                 }
+                Err(AppEditError::Transaction(error)) => {
+                    error!("transaction edit failed: {error}");
+                }
                 Err(AppEditError::Conflict(error)) => {
                     warn!("edit conflict: {error}");
                 }
@@ -2210,6 +2213,48 @@ mod tests {
             reopened.parameters()[&ParamId::new("arm_length").expect("parameter")].scalar_value(),
             3.4
         );
+    }
+
+    #[test]
+    fn gui_transform_edit_persists_through_transaction_and_reopen() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        let request = model
+            .set_selected_node_transform_literal(
+                &NodeId::new("body").expect("body"),
+                geom_scene::TransformProperty::Translation,
+                geom_scene::Axis::X,
+                2.75,
+                EditOrigin::Gui,
+                Instant::now(),
+            )
+            .expect("set transform")
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+
+        assert!(
+            model
+                .workspace_summary()
+                .expect("workspace")
+                .revision()
+                .get()
+                >= 2,
+            "workspace revision should advance through the persisted transaction"
+        );
+
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("reparse");
+        match &reopened.nodes()[&NodeId::new("body").expect("body")]
+            .transform()
+            .translation
+            .x
+        {
+            geom_scene::ScalarExpr::Literal(value) => assert_eq!(*value, 2.75),
+            other => panic!("unexpected translation expr: {other:?}"),
+        }
     }
 
     #[test]

@@ -34,9 +34,10 @@ The current `bevy_egui` integration exposes anchored windows rather than dock/pa
 
 - Inspector values are read directly from the current accepted `SceneDocument`.
 - The UI does not keep a second mutable semantic scene copy.
-- Accepted edits dispatch typed app commands into the existing M05 path:
+- Accepted edits dispatch typed app commands into the M07 transaction foundation and then the
+  existing M05 path:
 
-  `egui -> AppCommand -> AppModel -> SceneSource -> validate -> workspace save -> reactive rebuild`
+  `egui -> AppCommand -> AppModel -> WorkspaceTransaction -> SceneSource -> workspace save -> reactive rebuild`
 
 ## Transform and primitive editing
 
@@ -79,10 +80,9 @@ The current `bevy_egui` integration exposes anchored windows rather than dock/pa
 
 ## M06 / M07 boundary
 
-M06 adds direct GUI authoring over TOML-backed scene state, but it does not add:
+M06 added direct GUI authoring over TOML-backed scene state. Early M07 now adds the structured
+transaction foundation, but it still does not add:
 
-- `WorkspaceOp`
-- transactions
 - undo/redo
 - provenance/history
 - structured transaction diffs

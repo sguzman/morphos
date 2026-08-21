@@ -37,11 +37,12 @@ External source flow:
 Internal source flow:
 
 1. Morphos starts from the latest known source text
-2. it applies a targeted `SceneSource` edit
-3. it verifies the on-disk source still matches the edit base fingerprint
-4. it persists through `geom_workspace`
-5. it records the expected own-write fingerprint
-6. it schedules the same reactive build path used by watcher-triggered changes
+2. it verifies the on-disk source still matches the edit base fingerprint
+3. it constructs a typed `WorkspaceTransaction`
+4. `geom_workspace` validates and applies the transaction through `SceneSource`
+5. it persists through the canonical workspace save path
+6. it records the expected own-write fingerprint
+7. it schedules the same reactive build path used by watcher-triggered changes
 
 ## Revision Semantics
 
