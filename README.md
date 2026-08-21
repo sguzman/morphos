@@ -8,9 +8,10 @@ Agents should check boxes only after the implementation exists and the relevant 
 passes. When a blocker or follow-up is discovered during implementation, record it in the
 relevant milestone instead of silently skipping it or pulling later-milestone scope forward.
 
-Current implementation status: this repository contains bootstrap scaffolding only. It does
-not yet implement workspace persistence, scene parsing, geometry evaluation, GUI behavior, or
-AI editing workflows.
+Current implementation status: the repository now includes the durable `geom_workspace`
+foundation from M01. Morphos can create, open, inspect, mutate, save, and reopen a workspace
+without geometry, scene-schema, GUI, CLI product, or AI integration. Scene language design,
+geometry evaluation, viewport behavior, and higher-level editing systems remain future work.
 
 ## Architecture invariants
 
@@ -31,6 +32,17 @@ AI editing workflows.
 - `milestones/`: canonical milestone files and milestone index.
 - `.github/workflows/ci.yml`: baseline continuous integration workflow.
 - `tmp/`: local reference material only; intentionally ignored and never canonical.
+
+## Current workspace layout
+
+`geom_workspace` currently manages this on-disk structure:
+
+- `<workspace>/source/scene.toml`: the canonical opaque source document reserved for M02.
+- `<workspace>/exports/`: reserved export/output directory.
+- `<workspace>/.morphos/workspace.toml`: versioned workspace metadata including stable ID.
+- `<workspace>/.morphos/cache/`: disposable generated cache data.
+- `<workspace>/.morphos/history/`: reserved history path for later milestones.
+- `<workspace>/.morphos/ai/`: reserved AI/session-data path for later milestones.
 
 ## Canonical commands
 
