@@ -1,0 +1,61 @@
+schema_version = 1
+root = "robot"
+
+[extensions]
+author = "Morphos"
+category = "prop"
+
+[params.head_size]
+type = "scalar"
+value = 1.1
+extensions = { units = "scene" }
+
+[params.arm_length]
+type = "scalar"
+value = 1.4
+
+[nodes.robot]
+kind = "union"
+children = ["torso", "head", "left_arm", "right_arm", "base"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+extensions = { role = "root" }
+
+[nodes.torso]
+kind = "box"
+label = "Torso"
+size = { x = 1.8, y = 2.4, z = 1.0 }
+transform = { translate = { x = 0.0, y = 1.8, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.head]
+kind = "box"
+size = { x = { param = "head_size" }, y = { param = "head_size" }, z = { param = "head_size" } }
+transform = { translate = { x = 0.0, y = 3.6, z = 0.0 }, rotate_deg = { x = 0.0, y = 10.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.left_arm]
+kind = "capsule"
+radius = 0.18
+height = { param = "arm_length" }
+transform = { translate = { x = -1.2, y = 2.1, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 90.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.right_arm]
+kind = "capsule"
+radius = 0.18
+height = { param = "arm_length" }
+transform = { translate = { x = 1.2, y = 2.1, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = -90.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.base]
+kind = "intersection"
+children = ["base_plate", "footprint"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.base_plate]
+kind = "plane"
+width = 2.2
+depth = 1.6
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.footprint]
+kind = "profile"
+width = 1.9
+height = 1.1
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }

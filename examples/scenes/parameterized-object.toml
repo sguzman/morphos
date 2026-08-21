@@ -1,0 +1,19 @@
+schema_version = 1
+root = "cabinet"
+
+[params.width]
+type = "scalar"
+value = 2.5
+
+[params.height]
+type = "scalar"
+value = 3.0
+
+[params.depth]
+type = "scalar"
+value = 1.2
+
+[nodes.cabinet]
+kind = "box"
+size = { x = { param = "width" }, y = { param = "height" }, z = { param = "depth" } }
+transform = { translate = { x = 0.0, y = 1.5, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }

@@ -1,0 +1,7 @@
+schema_version = 1
+root = "cube"
+
+[nodes.cube]
+kind = "box"
+size = { x = 1.0, y = 1.0, z = 1.0 }
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }

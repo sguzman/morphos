@@ -1,0 +1,28 @@
+schema_version = 1
+root = "shape"
+
+[nodes.shape]
+kind = "difference"
+children = ["body", "cutout"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.body]
+kind = "union"
+children = ["base", "tower"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.base]
+kind = "box"
+size = { x = 4.0, y = 1.0, z = 4.0 }
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.tower]
+kind = "cylinder"
+radius = 1.0
+height = 3.0
+transform = { translate = { x = 0.0, y = 2.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.cutout]
+kind = "sphere"
+radius = 0.8
+transform = { translate = { x = 0.0, y = 1.5, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
