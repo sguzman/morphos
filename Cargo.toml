@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/geom_scene", "crates/geom_workspace"]
+members = [
+    "crates/geom_geometry",
+    "crates/geom_scene",
+    "crates/geom_workspace",
+]
 resolver = "3"
 
 [workspace.package]

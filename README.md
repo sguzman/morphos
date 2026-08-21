@@ -9,11 +9,13 @@ passes. When a blocker or follow-up is discovered during implementation, record 
 relevant milestone instead of silently skipping it or pulling later-milestone scope forward.
 
 Current implementation status: the repository now includes the durable `geom_workspace`
-foundation from M01 and the declarative `geom_scene` schema layer from M02. Morphos can create,
-open, inspect, mutate, save, and reopen a workspace, and it can parse, validate, canonically
-serialize, and source-edit versioned TOML scene documents without geometry evaluation, GUI,
-CLI product, or AI integration. Geometry evaluation, viewport behavior, and higher-level
-editing systems remain future work.
+foundation from M01, the declarative `geom_scene` schema layer from M02, and the headless
+`geom_geometry` evaluation layer from M03. Morphos can create, open, inspect, mutate, save, and
+reopen a workspace; parse, validate, canonically serialize, and source-edit versioned TOML scene
+documents; and deterministically evaluate a validated `SceneDocument` into Morphos-owned mesh,
+bounds, and statistics results through a backend-neutral geometry API with selective evaluation
+and dependency-aware caching. GUI, viewport shell, CLI product commands, and AI integration
+remain future work.
 
 ## Architecture invariants
 
@@ -32,9 +34,13 @@ editing systems remain future work.
   durable project state.
 - `crates/geom_scene`: the declarative scene schema crate for TOML parsing, validation,
   canonical serialization, and source-preserving edits.
+- `crates/geom_geometry`: the backend-neutral geometry IR, evaluation graph, cache, and headless
+  mesh-generation crate introduced in M03.
 - `docs/architecture.md`: the bootstrap architecture contract and development rules.
 - `docs/scene-schema.md`: the M02 scene grammar, conventions, edit model, and workspace
   relationship.
+- `docs/geometry-evaluation.md`: the M03 geometry IR, backend boundary, caching, and transform
+  contract.
 - `milestones/`: canonical milestone files and milestone index.
 - `.github/workflows/ci.yml`: baseline continuous integration workflow.
 - `tmp/`: local reference material only; intentionally ignored and never canonical.
@@ -66,4 +72,4 @@ If `just` is installed, the same workflows are available through `just build`, `
 
 Start at [milestones/README.md](milestones/README.md). M00 is tracked in
 [milestones/M00-project-bootstrap.md](milestones/M00-project-bootstrap.md). M02 scene examples
-live under `examples/scenes/`.
+live under `examples/scenes/`, including the M03 benchmark/cache fixture.

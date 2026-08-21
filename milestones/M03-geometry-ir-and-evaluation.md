@@ -14,44 +14,54 @@ Owns geometry IR, dependency evaluation, backend traits, mesh results, and evalu
 
 ### Geometry IR
 
-- [ ] Define a backend-neutral `Shape`/geometry IR.
-- [ ] Represent primitives, transforms, and boolean composition in the IR.
-- [ ] Keep source node IDs attached through evaluation for diagnostics/provenance.
-- [ ] Define an evaluated mesh type or adapter owned by Morphos.
-- [ ] Define geometry bounds and basic statistics independent of the backend.
+- [x] Define a backend-neutral `Shape`/geometry IR.
+- [x] Represent primitives, transforms, and boolean composition in the IR.
+- [x] Keep source node IDs attached through evaluation for diagnostics/provenance.
+- [x] Define an evaluated mesh type or adapter owned by Morphos.
+- [x] Define geometry bounds and basic statistics independent of the backend.
 
 ### Evaluation graph
 
-- [ ] Resolve scene references into an evaluable dependency graph.
-- [ ] Detect cycles before geometry evaluation.
-- [ ] Evaluate nodes in deterministic dependency order.
-- [ ] Allow evaluation of a selected output/subtree rather than always rebuilding the entire scene.
-- [ ] Add revision-aware caching so unchanged subtrees can be reused.
-- [ ] Invalidate only dependent nodes when a parameter/node changes.
+- [x] Resolve scene references into an evaluable dependency graph.
+- [x] Detect cycles before geometry evaluation.
+- [x] Evaluate nodes in deterministic dependency order.
+- [x] Allow evaluation of a selected output/subtree rather than always rebuilding the entire scene.
+- [x] Add revision-aware caching so unchanged subtrees can be reused.
+- [x] Invalidate only dependent nodes when a parameter/node changes.
 
 ### Backend abstraction
 
-- [ ] Define a `GeometryBackend` trait/interface owned by Morphos.
-- [ ] Implement one production backend using an existing Rust-accessible CSG library.
-- [ ] Convert backend output into the Morphos mesh representation.
-- [ ] Normalize backend errors into project-owned diagnostics.
-- [ ] Ensure backend-specific types do not leak into workspace, UI, CLI, or AI crates.
+- [x] Define a `GeometryBackend` trait/interface owned by Morphos.
+- [x] Implement one production backend using an existing Rust-accessible CSG library.
+- [x] Convert backend output into the Morphos mesh representation.
+- [x] Normalize backend errors into project-owned diagnostics.
+- [x] Ensure backend-specific types do not leak into workspace, UI, CLI, or AI crates.
 
 ### Parameters and transforms
 
-- [ ] Resolve reusable parameters during evaluation.
-- [ ] Support transform composition with documented ordering.
-- [ ] Reject non-finite or otherwise invalid transform/parameter values.
-- [ ] Expose evaluated parameter values for diagnostics/UI.
+- [x] Resolve reusable parameters during evaluation.
+- [x] Support transform composition with documented ordering.
+- [x] Reject non-finite or otherwise invalid transform/parameter values.
+- [x] Expose evaluated parameter values for diagnostics/UI.
 
 ### Tests and benchmarks
 
-- [ ] Add deterministic primitive evaluation tests.
-- [ ] Add union/difference/intersection tests.
-- [ ] Add transform-order tests.
-- [ ] Add dependency/cycle tests.
-- [ ] Add cache invalidation tests.
-- [ ] Add a small benchmark scene to track rebuild latency.
+- [x] Add deterministic primitive evaluation tests.
+- [x] Add union/difference/intersection tests.
+- [x] Add transform-order tests.
+- [x] Add dependency/cycle tests.
+- [x] Add cache invalidation tests.
+- [x] Add a small benchmark scene to track rebuild latency.
+
+## Notes
+
+- Production backend selection: M03 uses the Rust-native `boolmesh` kernel behind
+  `GeometryBackend`. `manifold-csg` was investigated first for robustness, but its native source
+  bootstrap stalled in this Windows environment during implementation verification. The final M03
+  backend remains fully encapsulated behind Morphos-owned APIs so it can be swapped later without
+  changing the scene schema.
+- `plane` and `profile` are preserved in the IR but intentionally return typed
+  `UnsupportedShape` evaluation errors until M13 defines richer profile/extrusion semantics.
 
 ## Completion criteria
 

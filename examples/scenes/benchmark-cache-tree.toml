@@ -1,0 +1,65 @@
+schema_version = 1
+root = "root"
+
+[params.left_width]
+type = "scalar"
+value = 1.25
+
+[params.right_width]
+type = "scalar"
+value = 1.1
+
+[params.tower_height]
+type = "scalar"
+value = 2.4
+
+[nodes.left_body]
+kind = "box"
+size = { x = { param = "left_width" }, y = { param = "tower_height" }, z = 1.0 }
+transform = { translate = { x = -2.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.left_cap]
+kind = "sphere"
+radius = 0.75
+transform = { translate = { x = -2.0, y = 1.3, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.left_tower]
+kind = "union"
+children = ["left_body", "left_cap"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.right_body]
+kind = "box"
+size = { x = { param = "right_width" }, y = { param = "tower_height" }, z = 1.0 }
+transform = { translate = { x = 2.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.right_cap]
+kind = "sphere"
+radius = 0.6
+transform = { translate = { x = 2.0, y = 1.1, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.right_tower]
+kind = "union"
+children = ["right_body", "right_cap"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.bridge]
+kind = "box"
+size = { x = 4.6, y = 0.5, z = 0.9 }
+transform = { translate = { x = 0.0, y = 0.6, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.portal_cutout]
+kind = "cylinder"
+radius = 0.45
+height = 2.2
+transform = { translate = { x = 0.0, y = -0.25, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 90.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.arch]
+kind = "difference"
+children = ["bridge", "portal_cutout"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.root]
+kind = "union"
+children = ["left_tower", "right_tower", "arch"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
