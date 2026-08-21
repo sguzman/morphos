@@ -17,7 +17,9 @@ bounds, and statistics results through a backend-neutral geometry API with selec
 and dependency-aware caching; launch the first desktop viewport shell through `geom_app`; and
 reactively rebuild the viewport from external or in-app source edits through a watched
 `source/scene.toml` loop with last-good preview preservation, stale-result suppression, and
-timing instrumentation. CLI product commands and AI integration remain future work.
+timing instrumentation; and directly author the current scene schema through a scene tree,
+inspector, parameter controls, and basic structural editing while TOML remains canonical. CLI
+product commands and AI integration remain future work.
 
 ## Architecture invariants
 
@@ -48,6 +50,8 @@ timing instrumentation. CLI product commands and AI integration remain future wo
 - `docs/viewport.md`: viewport launch, camera mapping, and manual viewport verification.
 - `docs/reactive-editing.md`: the M05 watcher architecture, generation semantics, own-write
   suppression, timing harness, and reactive verification procedure.
+- `docs/authoring-ui.md`: the M06 scene-tree, inspector, parameter, structural-editing, and
+  invalid-source authoring behavior.
 - `milestones/`: canonical milestone files and milestone index.
 - `.github/workflows/ci.yml`: baseline continuous integration workflow.
 - `tmp/`: local reference material only; intentionally ignored and never canonical.
@@ -70,6 +74,7 @@ timing instrumentation. CLI product commands and AI integration remain future wo
 - Format: `cargo fmt --check`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Launch the viewport shell: `cargo run -p geom_app -- examples/workspaces/viewport-smoke`
+- Launch the authoring smoke workspace: `cargo run -p geom_app -- examples/workspaces/authoring-smoke`
 - Measure reactive timings: `cargo test -p geom_app reactive_timing_harness -- --ignored --nocapture`
 
 The baseline lint policy for M00 is that workspace Clippy warnings are treated as errors.

@@ -19,7 +19,8 @@ impl SceneTreeModel {
             for dependency in &dependency_ids {
                 *incoming_counts.entry(dependency.clone()).or_insert(0) += 1;
             }
-            let scalar_parameter_dependencies = scalar_parameter_dependencies(node.kind(), node.transform());
+            let scalar_parameter_dependencies =
+                scalar_parameter_dependencies(node.kind(), node.transform());
             for parameter in &scalar_parameter_dependencies {
                 parameter_dependents
                     .entry(parameter.clone())
@@ -55,7 +56,9 @@ impl SceneTreeModel {
 
         let mut unreferenced = entries
             .values()
-            .filter(|entry| !visited.contains(&entry.node_id) && entry.incoming_reference_count == 0)
+            .filter(|entry| {
+                !visited.contains(&entry.node_id) && entry.incoming_reference_count == 0
+            })
             .map(|entry| entry.node_id.clone())
             .collect::<Vec<_>>();
         unreferenced.sort();
@@ -111,7 +114,11 @@ impl SceneTreeModel {
         self.entries
             .values()
             .filter(|entry| {
-                entry.node_id.as_str().to_ascii_lowercase().contains(&needle)
+                entry
+                    .node_id
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .contains(&needle)
                     || entry
                         .label
                         .as_deref()
@@ -131,6 +138,47 @@ impl SceneTreeModel {
             .collect::<Vec<_>>();
         dependents.sort();
         dependents
+    }
+
+    pub fn direct_dependents(&self, node: &NodeId) -> Vec<NodeId> {
+        let mut dependents = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .dependency_ids
+                    .iter()
+                    .any(|dependency| dependency == node)
+            })
+            .map(|entry| entry.node_id.clone())
+            .collect::<Vec<_>>();
+        dependents.sort();
+        dependents
+    }
+
+    pub fn transitive_dependents(&self, node: &NodeId) -> Vec<NodeId> {
+        let mut out = BTreeSet::new();
+        let mut stack = self.direct_dependents(node);
+        while let Some(next) = stack.pop() {
+            if out.insert(next.clone()) {
+                stack.extend(self.direct_dependents(&next));
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    pub fn transitive_parameter_dependents(&self, parameter: &ParamId) -> Vec<NodeId> {
+        let direct = self.parameter_dependents(parameter);
+        let mut out: BTreeSet<NodeId> = direct.iter().cloned().collect();
+        let mut stack = direct;
+        while let Some(next) = stack.pop() {
+            for dependent in self.direct_dependents(&next) {
+                if out.insert(dependent.clone()) {
+                    stack.push(dependent);
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 }
 
@@ -153,14 +201,19 @@ impl SceneTreeEntry {
 
 fn dependency_ids(kind: &NodeKind) -> Vec<NodeId> {
     match kind {
-        NodeKind::Union(node) | NodeKind::Difference(node) | NodeKind::Intersection(node) => {
-            node.children.iter().map(|child| child.target().clone()).collect()
-        }
+        NodeKind::Union(node) | NodeKind::Difference(node) | NodeKind::Intersection(node) => node
+            .children
+            .iter()
+            .map(|child| child.target().clone())
+            .collect(),
         _ => Vec::new(),
     }
 }
 
-fn scalar_parameter_dependencies(kind: &NodeKind, transform: &geom_scene::Transform) -> BTreeSet<ParamId> {
+fn scalar_parameter_dependencies(
+    kind: &NodeKind,
+    transform: &geom_scene::Transform,
+) -> BTreeSet<ParamId> {
     let mut out = BTreeSet::new();
     match kind {
         NodeKind::Box(node) => {
@@ -276,10 +329,11 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
 
         assert_eq!(tree.roots(), &[NodeId::new("root").expect("id")]);
         assert_eq!(tree.unreferenced(), &[NodeId::new("orphan").expect("id")]);
-        assert!(tree
-            .entry(&NodeId::new("shared").expect("id"))
-            .expect("entry")
-            .is_shared());
+        assert!(
+            tree.entry(&NodeId::new("shared").expect("id"))
+                .expect("entry")
+                .is_shared()
+        );
     }
 
     #[test]
@@ -319,10 +373,17 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
         let scene = parse_scene(SHARED_SCENE).expect("parse");
         let tree = SceneTreeModel::from_scene(&scene);
         let root = NodeId::new("root").expect("id");
-        assert_eq!(tree.preserve_selection(Some(&root), None, None), Some(root.clone()));
+        assert_eq!(
+            tree.preserve_selection(Some(&root), None, None),
+            Some(root.clone())
+        );
 
-        let renamed_scene = parse_scene(SHARED_SCENE.replace("\"shared\"", "\"arm_shared\"").as_str())
-            .expect_err("broken scene should fail before explicit test");
+        let renamed_scene = parse_scene(
+            SHARED_SCENE
+                .replace("\"shared\"", "\"arm_shared\"")
+                .as_str(),
+        )
+        .expect_err("broken scene should fail before explicit test");
         let _ = renamed_scene;
 
         let updated = parse_scene(

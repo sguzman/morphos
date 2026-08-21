@@ -1,0 +1,4 @@
+format_version = 1
+workspace_id = "b2cc3933-7d54-4f8b-b9df-2d59bd4e0541"
+name = "Authoring Smoke"
+description = "Workspace fixture for M06 authoring UI coverage"

@@ -325,11 +325,7 @@ impl SceneSource {
     }
 
     /// Renames a node and updates root/child references.
-    pub fn rename_node(
-        &mut self,
-        from: &NodeId,
-        to: &NodeId,
-    ) -> Result<SceneDocument, SceneError> {
+    pub fn rename_node(&mut self, from: &NodeId, to: &NodeId) -> Result<SceneDocument, SceneError> {
         if from == to {
             return self.validate();
         }
@@ -349,10 +345,7 @@ impl SceneSource {
                 ));
             }
             nodes_table.remove(from.as_str()).ok_or_else(|| {
-                SceneError::new(
-                    SceneErrorKind::MissingNode { node: from.clone() },
-                    None,
-                )
+                SceneError::new(SceneErrorKind::MissingNode { node: from.clone() }, None)
             })?
         };
 
@@ -368,8 +361,7 @@ impl SceneSource {
                 let Some(node_table) = node_item.as_table_mut() else {
                     continue;
                 };
-                let Some(children) =
-                    node_table.get_mut("children").and_then(Item::as_array_mut)
+                let Some(children) = node_table.get_mut("children").and_then(Item::as_array_mut)
                 else {
                     continue;
                 };
@@ -413,10 +405,14 @@ impl SceneSource {
                     None,
                 ));
             }
-            nodes_table
-                .get(source.as_str())
-                .cloned()
-                .ok_or_else(|| SceneError::new(SceneErrorKind::MissingNode { node: source.clone() }, None))?
+            nodes_table.get(source.as_str()).cloned().ok_or_else(|| {
+                SceneError::new(
+                    SceneErrorKind::MissingNode {
+                        node: source.clone(),
+                    },
+                    None,
+                )
+            })?
         };
 
         let nodes_table = self
@@ -2847,5 +2843,110 @@ extensions = { material = "matte" }
             reparsed.parameters()[&ParamId::new("width").expect("param id")].scalar_value(),
             9.0
         );
+    }
+
+    #[test]
+    fn rename_updates_root_and_composition_references_without_rewriting_unrelated_comments() {
+        let source = r#"
+schema_version = 1
+root = "root"
+
+# keep this top comment
+[nodes.shared]
+kind = "sphere"
+radius = 1.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.root]
+kind = "union"
+children = ["shared", "shared"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#;
+        let mut scene = SceneSource::parse(source).expect("parse");
+        let document = scene
+            .rename_node(
+                &NodeId::new("shared").expect("from"),
+                &NodeId::new("core").expect("to"),
+            )
+            .expect("rename");
+        let updated = scene.text();
+
+        assert!(updated.contains("# keep this top comment"));
+        assert!(updated.contains("[nodes.core]"));
+        assert!(updated.contains("children = [\"core\", \"core\"]"));
+        assert!(
+            document
+                .nodes()
+                .contains_key(&NodeId::new("core").expect("id"))
+        );
+    }
+
+    #[test]
+    fn duplicate_and_delete_structural_edits_preserve_other_sections() {
+        let source = r#"
+schema_version = 1
+root = "root"
+
+[params.width]
+type = "scalar"
+value = 2.0
+
+[nodes.part]
+kind = "box"
+size = { x = { param = "width" }, y = 1.0, z = 1.0 }
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.root]
+kind = "union"
+children = ["part", "part"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#;
+        let mut scene = SceneSource::parse(source).expect("parse");
+        scene
+            .duplicate_node(
+                &NodeId::new("part").expect("source"),
+                &NodeId::new("part_copy").expect("duplicate"),
+            )
+            .expect("duplicate");
+        let duplicated = parse_scene(scene.text()).expect("reparse duplicated");
+        assert!(
+            duplicated
+                .nodes()
+                .contains_key(&NodeId::new("part_copy").expect("id"))
+        );
+        match duplicated.nodes()[&NodeId::new("part_copy").expect("id")].kind() {
+            NodeKind::Box(box_node) => {
+                assert!(matches!(box_node.size.x, ScalarExpr::Parameter(_)));
+            }
+            other => panic!("unexpected duplicated kind: {other:?}"),
+        }
+
+        let mut scene = SceneSource::parse(
+            r#"
+schema_version = 1
+root = "root"
+
+[nodes.deletable]
+kind = "sphere"
+radius = 0.5
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.root]
+kind = "union"
+children = ["other", "other"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.other]
+kind = "sphere"
+radius = 0.75
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#,
+        )
+        .expect("parse deletable");
+        scene
+            .delete_node(&NodeId::new("deletable").expect("id"))
+            .expect("delete");
+        assert!(!scene.text().contains("[nodes.deletable]"));
+        assert!(scene.text().contains("[nodes.other]"));
     }
 }

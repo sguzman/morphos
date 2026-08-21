@@ -1,0 +1,75 @@
+schema_version = 1
+root = "assembly"
+
+[extensions]
+author = "Morphos"
+purpose = "M06 authoring smoke workspace"
+
+[params.body_width]
+type = "scalar"
+value = 1.8
+extensions = { units = "scene" }
+
+[params.arm_length]
+type = "scalar"
+value = 1.6
+extensions = { units = "scene" }
+
+[params.head_size]
+type = "scalar"
+value = 0.9
+
+[nodes.assembly]
+kind = "union"
+label = "Assembly"
+children = ["torso", "head", "left_arm", "right_arm", "cutout_base"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.torso]
+kind = "box"
+label = "Torso"
+size = { x = { param = "body_width" }, y = 2.1, z = 1.0 }
+transform = { translate = { x = 0.0, y = 1.4, z = 0.0 }, rotate_deg = { x = 0.0, y = 8.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.head]
+kind = "sphere"
+label = "Head"
+radius = { param = "head_size" }
+transform = { translate = { x = 0.0, y = 3.1, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.left_arm]
+kind = "capsule"
+label = "Left Arm"
+radius = 0.18
+height = { param = "arm_length" }
+transform = { translate = { x = -1.2, y = 2.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 90.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.right_arm]
+kind = "capsule"
+label = "Right Arm"
+radius = 0.18
+height = { param = "arm_length" }
+transform = { translate = { x = 1.2, y = 2.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = -90.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.cutout_base]
+kind = "difference"
+label = "Base With Cutout"
+children = ["base_block", "base_cutout"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.base_block]
+kind = "box"
+size = { x = 1.9, y = 0.7, z = 1.1 }
+transform = { translate = { x = 0.0, y = 0.35, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.base_cutout]
+kind = "cylinder"
+radius = 0.22
+height = 0.9
+transform = { translate = { x = 0.0, y = 0.35, z = 0.0 }, rotate_deg = { x = 90.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.spare_sensor]
+kind = "sphere"
+label = "Spare Sensor"
+radius = 0.22
+transform = { translate = { x = 2.3, y = 1.1, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }

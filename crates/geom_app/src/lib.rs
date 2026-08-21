@@ -12,17 +12,16 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use camera::{CameraFrame, OrbitCameraInputMap, OrbitCameraState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use geom_geometry::Bounds;
-use geom_scene::{
-    Axis, NodeId, ParamId, PrimitiveScalarField, SceneNodeDraft, TransformProperty,
-};
+use geom_scene::{Axis, NodeId, ParamId, PrimitiveScalarField, SceneNodeDraft, TransformProperty};
 use mesh_adapter::adapt_morphos_mesh;
 use model::{
-    AppEditError, AppModel, BuildStatusKind, DisplayedGeometry, UiStatusSnapshot,
+    AppEditError, AppModel, BuildStatusKind, DeleteNodeSafety, DisplayedGeometry, UiStatusSnapshot,
     ViewportDisplayMode, ViewportSelection, WorkspaceBuildError,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reactive::{BuildOutcome, BuildWorker, EditOrigin, WorkerCommand, WorkspaceSessionId};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
@@ -240,7 +239,14 @@ enum AddNodeKind {
 
 impl AddNodeKind {
     fn all() -> [Self; 6] {
-        [Self::Box, Self::Sphere, Self::Cylinder, Self::Capsule, Self::Plane, Self::Profile]
+        [
+            Self::Box,
+            Self::Sphere,
+            Self::Cylinder,
+            Self::Capsule,
+            Self::Plane,
+            Self::Profile,
+        ]
     }
 
     fn label(self) -> &'static str {
@@ -294,17 +300,19 @@ fn ui_system(
     mut contexts: EguiContexts,
     app_model: Res<AppModel>,
     viewport: Res<ViewportRuntimeState>,
+    mut editor_state: ResMut<SceneEditorUiState>,
     mut commands: MessageWriter<AppCommand>,
     mut pointer_capture: ResMut<UiPointerCapture>,
 ) -> Result {
     let context = contexts.ctx_mut()?;
     let status = build_ui_snapshot(&app_model, &viewport);
+    synchronize_editor_buffers(&app_model, &viewport, &mut editor_state);
 
     egui::Window::new("Morphos Status")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
         .collapsible(false)
         .resizable(false)
-        .default_width(920.0)
+        .default_width(980.0)
         .show(context, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
@@ -360,7 +368,6 @@ fn ui_system(
             });
 
             if let Some(timings) = status.timings {
-                ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("Parse: {:.2} ms", timings.parse_millis));
                     ui.separator();
@@ -372,8 +379,7 @@ fn ui_system(
                 });
             }
 
-            ui.separator();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Reload / Rebuild").clicked() {
                     commands.write(AppCommand::Rebuild);
                 }
@@ -414,7 +420,28 @@ fn ui_system(
                 {
                     commands.write(AppCommand::SetDisplayMode(ViewportDisplayMode::Wireframe));
                 }
+
+                let mut mesh_visible = viewport.mesh_visible;
+                if ui.checkbox(&mut mesh_visible, "Preview Visible").changed() {
+                    commands.write(AppCommand::SetMeshVisibility(mesh_visible));
+                }
             });
+        });
+
+    egui::Window::new("Scene Tree")
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 116.0))
+        .default_width(300.0)
+        .default_height(620.0)
+        .show(context, |ui| {
+            render_scene_tree_panel(ui, &app_model, &viewport, &mut editor_state, &mut commands);
+        });
+
+    egui::Window::new("Inspector")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 116.0))
+        .default_width(380.0)
+        .default_height(680.0)
+        .show(context, |ui| {
+            render_inspector_panel(ui, &app_model, &viewport, &mut editor_state, &mut commands);
         });
 
     let overlay_message = match status.build_kind {
@@ -443,6 +470,804 @@ fn ui_system(
 
     pointer_capture.wants_pointer_input = context.egui_wants_pointer_input();
     Ok(())
+}
+
+fn synchronize_editor_buffers(
+    app_model: &AppModel,
+    viewport: &ViewportRuntimeState,
+    editor_state: &mut SceneEditorUiState,
+) {
+    let selected = viewport.selection.selected_node.clone();
+    if editor_state.selected_node_cache == selected {
+        return;
+    }
+
+    editor_state.selected_node_cache = selected.clone();
+    if let Some(scene) = app_model.current_scene()
+        && let Some(selected) = selected.as_ref()
+        && let Some(node) = scene.nodes().get(selected)
+    {
+        editor_state.label_buffer = node.label().unwrap_or_default().to_owned();
+        editor_state.rename_buffer = node.id().as_str().to_owned();
+        editor_state.duplicate_buffer = next_suffixed_id(scene, node.id(), "_copy");
+    } else {
+        editor_state.label_buffer.clear();
+        editor_state.rename_buffer.clear();
+        editor_state.duplicate_buffer.clear();
+    }
+}
+
+fn render_scene_tree_panel(
+    ui: &mut egui::Ui,
+    app_model: &AppModel,
+    viewport: &ViewportRuntimeState,
+    editor_state: &mut SceneEditorUiState,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Scene Tree");
+    ui.add(
+        egui::TextEdit::singleline(&mut editor_state.search_query)
+            .hint_text("Search by NodeId or label"),
+    );
+    ui.separator();
+
+    let Some(scene) = app_model.current_scene() else {
+        ui.label("No scene loaded.");
+        return;
+    };
+    let tree = app_model
+        .scene_tree_model()
+        .expect("tree exists when current scene exists");
+    let matches = tree.filtered_matches(&editor_state.search_query);
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for root in tree.roots() {
+            render_tree_entry(ui, &tree, root, &matches, viewport, commands);
+        }
+
+        if !tree.unreferenced().is_empty() {
+            ui.separator();
+            egui::CollapsingHeader::new("Unreferenced Nodes")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for node in tree.unreferenced() {
+                        render_tree_entry(ui, &tree, node, &matches, viewport, commands);
+                    }
+                });
+        }
+
+        ui.separator();
+        ui.heading("Add Primitive");
+        ui.horizontal(|ui| {
+            ui.label("Id");
+            ui.text_edit_singleline(&mut editor_state.add_node_id);
+        });
+        egui::ComboBox::from_label("Kind")
+            .selected_text(editor_state.add_kind.label())
+            .show_ui(ui, |ui| {
+                for kind in AddNodeKind::all() {
+                    ui.selectable_value(&mut editor_state.add_kind, kind, kind.label());
+                }
+            });
+        if ui.button("Add Unreferenced Node").clicked()
+            && let Ok(node_id) = NodeId::new(editor_state.add_node_id.trim())
+        {
+            commands.write(AppCommand::AddNode(node_id, editor_state.add_kind.draft()));
+        }
+
+        if scene.nodes().contains_key(scene.root()) {
+            ui.small(format!("Root output: {}", scene.root()));
+        }
+    });
+}
+
+fn render_tree_entry(
+    ui: &mut egui::Ui,
+    tree: &scene_tree::SceneTreeModel,
+    node_id: &NodeId,
+    matches: &std::collections::BTreeSet<NodeId>,
+    viewport: &ViewportRuntimeState,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    if !matches.contains(node_id) {
+        let Some(entry) = tree.entry(node_id) else {
+            return;
+        };
+        if !entry
+            .dependency_ids
+            .iter()
+            .any(|child| matches.contains(child))
+        {
+            return;
+        }
+    }
+
+    let Some(entry) = tree.entry(node_id) else {
+        return;
+    };
+    let mut title = entry.node_id.to_string();
+    if let Some(label) = &entry.label {
+        let _ = write!(title, " ({label})");
+    }
+    let _ = write!(title, " [{}]", entry.kind_label);
+    if entry.is_root {
+        title.push_str(" root");
+    }
+    if entry.is_shared() {
+        title.push_str(" shared");
+    }
+
+    let selected = viewport.selection.selected_node.as_ref() == Some(node_id);
+    if entry.dependency_ids.is_empty() {
+        if ui.selectable_label(selected, title).clicked() {
+            commands.write(AppCommand::SelectNode(Some(node_id.clone())));
+        }
+        return;
+    }
+
+    egui::CollapsingHeader::new(title)
+        .default_open(entry.is_root)
+        .show(ui, |ui| {
+            if ui
+                .selectable_label(selected, format!("Select {}", entry.node_id))
+                .clicked()
+            {
+                commands.write(AppCommand::SelectNode(Some(node_id.clone())));
+            }
+            for child in &entry.dependency_ids {
+                render_tree_entry(ui, tree, child, matches, viewport, commands);
+            }
+        });
+}
+
+fn render_inspector_panel(
+    ui: &mut egui::Ui,
+    app_model: &AppModel,
+    viewport: &ViewportRuntimeState,
+    editor_state: &mut SceneEditorUiState,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Inspector");
+    let disabled_reason = app_model.editing_disabled_reason().map(str::to_owned);
+    if let Some(reason) = disabled_reason.as_deref() {
+        ui.colored_label(egui::Color32::LIGHT_YELLOW, reason);
+        ui.separator();
+    }
+
+    let Some(scene) = app_model.current_scene() else {
+        ui.label("No scene loaded.");
+        return;
+    };
+    let Some(selected) = viewport.selection.selected_node.as_ref() else {
+        ui.label("Select a node from the scene tree.");
+        render_parameter_panel(ui, app_model, disabled_reason.is_none(), commands);
+        return;
+    };
+    let Some(node) = scene.nodes().get(selected) else {
+        ui.label("Selected node is no longer present.");
+        render_parameter_panel(ui, app_model, disabled_reason.is_none(), commands);
+        return;
+    };
+
+    ui.label(format!("NodeId: {}", node.id()));
+    ui.label(format!("Kind: {}", node_kind_label(node.kind())));
+    ui.label(if scene.root() == node.id() {
+        "Root Output: yes"
+    } else {
+        "Root Output: no"
+    });
+    if let Some(location) = app_model.node_source_location(node.id()) {
+        ui.label(format!(
+            "Source: source/scene.toml line {}, column {}",
+            location.line, location.column
+        ));
+        if ui.button("Copy Source Location").clicked() {
+            ui.ctx().copy_text(format!(
+                "source/scene.toml:{}:{}",
+                location.line, location.column
+            ));
+        }
+    }
+    ui.separator();
+
+    let editing_enabled = disabled_reason.is_none();
+    ui.horizontal(|ui| {
+        ui.label("Label");
+        ui.add_enabled(
+            editing_enabled,
+            egui::TextEdit::singleline(&mut editor_state.label_buffer),
+        );
+        if ui
+            .add_enabled(editing_enabled, egui::Button::new("Apply"))
+            .clicked()
+        {
+            let label = editor_state.label_buffer.trim();
+            commands.write(AppCommand::SetNodeLabel(
+                node.id().clone(),
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_owned())
+                },
+            ));
+        }
+    });
+
+    render_transform_editor(ui, node.id(), node.transform(), editing_enabled, commands);
+    ui.separator();
+    render_kind_specific_editor(ui, node, editing_enabled, scene, commands);
+    ui.separator();
+    render_structural_editor(
+        ui,
+        app_model,
+        node.id(),
+        editing_enabled,
+        editor_state,
+        commands,
+    );
+    ui.separator();
+    render_parameter_panel(ui, app_model, editing_enabled, commands);
+}
+
+fn render_transform_editor(
+    ui: &mut egui::Ui,
+    node_id: &NodeId,
+    transform: &geom_scene::Transform,
+    editing_enabled: bool,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Transform");
+    render_scalar_expr_triplet(
+        ui,
+        node_id,
+        TransformProperty::Translation,
+        "Translate",
+        &transform.translation,
+        editing_enabled,
+        commands,
+    );
+    render_scalar_expr_triplet(
+        ui,
+        node_id,
+        TransformProperty::RotationDegrees,
+        "Rotate Deg",
+        &transform.rotation_deg,
+        editing_enabled,
+        commands,
+    );
+    render_scalar_expr_triplet(
+        ui,
+        node_id,
+        TransformProperty::Scale,
+        "Scale",
+        &transform.scale,
+        editing_enabled,
+        commands,
+    );
+}
+
+fn render_scalar_expr_triplet(
+    ui: &mut egui::Ui,
+    node_id: &NodeId,
+    property: TransformProperty,
+    label: &str,
+    vector: &geom_scene::Vector3Expr,
+    editing_enabled: bool,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        render_scalar_expr_component(
+            ui,
+            node_id,
+            property,
+            Axis::X,
+            "X",
+            &vector.x,
+            editing_enabled,
+            commands,
+        );
+        render_scalar_expr_component(
+            ui,
+            node_id,
+            property,
+            Axis::Y,
+            "Y",
+            &vector.y,
+            editing_enabled,
+            commands,
+        );
+        render_scalar_expr_component(
+            ui,
+            node_id,
+            property,
+            Axis::Z,
+            "Z",
+            &vector.z,
+            editing_enabled,
+            commands,
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scalar_expr_component(
+    ui: &mut egui::Ui,
+    node_id: &NodeId,
+    property: TransformProperty,
+    axis: Axis,
+    axis_label: &str,
+    expr: &geom_scene::ScalarExpr,
+    editing_enabled: bool,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.vertical(|ui| {
+        ui.label(axis_label);
+        match expr {
+            geom_scene::ScalarExpr::Literal(value) => {
+                let mut pending = *value;
+                let response = ui.add_enabled(
+                    editing_enabled,
+                    egui::DragValue::new(&mut pending)
+                        .speed(0.1)
+                        .range(-10_000.0..=10_000.0),
+                );
+                if response.changed() {
+                    commands.write(AppCommand::SetTransformComponent(
+                        node_id.clone(),
+                        property,
+                        axis,
+                        pending,
+                    ));
+                }
+            }
+            geom_scene::ScalarExpr::Parameter(parameter) => {
+                ui.label(format!("param: {}", parameter.target()));
+            }
+        }
+    });
+}
+
+fn render_kind_specific_editor(
+    ui: &mut egui::Ui,
+    node: &geom_scene::Node,
+    editing_enabled: bool,
+    scene: &geom_scene::SceneDocument,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Node Properties");
+    match node.kind() {
+        geom_scene::NodeKind::Box(primitive) => {
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::BoxX,
+                "Size X",
+                &primitive.size.x,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::BoxY,
+                "Size Y",
+                &primitive.size.y,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::BoxZ,
+                "Size Z",
+                &primitive.size.z,
+                editing_enabled,
+                commands,
+            );
+        }
+        geom_scene::NodeKind::Sphere(primitive) => render_literal_or_param_scalar(
+            ui,
+            node.id(),
+            PrimitiveScalarField::SphereRadius,
+            "Radius",
+            &primitive.radius,
+            editing_enabled,
+            commands,
+        ),
+        geom_scene::NodeKind::Cylinder(primitive) => {
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::CylinderRadius,
+                "Radius",
+                &primitive.radius,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::CylinderHeight,
+                "Height",
+                &primitive.height,
+                editing_enabled,
+                commands,
+            );
+        }
+        geom_scene::NodeKind::Capsule(primitive) => {
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::CapsuleRadius,
+                "Radius",
+                &primitive.radius,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::CapsuleHeight,
+                "Height",
+                &primitive.height,
+                editing_enabled,
+                commands,
+            );
+        }
+        geom_scene::NodeKind::Plane(primitive) => {
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::PlaneWidth,
+                "Width",
+                &primitive.width,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::PlaneDepth,
+                "Depth",
+                &primitive.depth,
+                editing_enabled,
+                commands,
+            );
+        }
+        geom_scene::NodeKind::Profile(primitive) => {
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::ProfileWidth,
+                "Width",
+                &primitive.width,
+                editing_enabled,
+                commands,
+            );
+            render_literal_or_param_scalar(
+                ui,
+                node.id(),
+                PrimitiveScalarField::ProfileHeight,
+                "Height",
+                &primitive.height,
+                editing_enabled,
+                commands,
+            );
+        }
+        geom_scene::NodeKind::Union(composition)
+        | geom_scene::NodeKind::Difference(composition)
+        | geom_scene::NodeKind::Intersection(composition) => {
+            ui.label("Ordered children");
+            let node_ids = scene.nodes().keys().cloned().collect::<Vec<_>>();
+            let current_children = composition
+                .children
+                .iter()
+                .map(|child| child.target().clone())
+                .collect::<Vec<_>>();
+            for (index, child) in current_children.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}", index + 1));
+                    if ui.button("Up").clicked() && index > 0 && editing_enabled {
+                        let mut reordered = current_children.clone();
+                        reordered.swap(index, index - 1);
+                        commands.write(AppCommand::SetCompositionChildren(
+                            node.id().clone(),
+                            reordered,
+                        ));
+                    }
+                    if ui.button("Down").clicked()
+                        && index + 1 < current_children.len()
+                        && editing_enabled
+                    {
+                        let mut reordered = current_children.clone();
+                        reordered.swap(index, index + 1);
+                        commands.write(AppCommand::SetCompositionChildren(
+                            node.id().clone(),
+                            reordered,
+                        ));
+                    }
+                    let mut replacement = child.clone();
+                    egui::ComboBox::from_id_salt(("child", node.id().as_str(), index))
+                        .selected_text(replacement.as_str())
+                        .show_ui(ui, |ui| {
+                            for candidate in &node_ids {
+                                if candidate != node.id() {
+                                    ui.selectable_value(
+                                        &mut replacement,
+                                        candidate.clone(),
+                                        candidate.as_str(),
+                                    );
+                                }
+                            }
+                        });
+                    if replacement != *child && editing_enabled {
+                        let mut replaced = current_children.clone();
+                        replaced[index] = replacement;
+                        commands.write(AppCommand::SetCompositionChildren(
+                            node.id().clone(),
+                            replaced,
+                        ));
+                    }
+                    if ui.button("Remove").clicked()
+                        && editing_enabled
+                        && current_children.len() > 2
+                    {
+                        let mut removed = current_children.clone();
+                        removed.remove(index);
+                        commands.write(AppCommand::SetCompositionChildren(
+                            node.id().clone(),
+                            removed,
+                        ));
+                    }
+                });
+            }
+
+            if editing_enabled {
+                ui.horizontal(|ui| {
+                    ui.label("Add child");
+                    let mut candidate = node_ids
+                        .iter()
+                        .find(|candidate| *candidate != node.id())
+                        .cloned()
+                        .unwrap_or_else(|| node.id().clone());
+                    egui::ComboBox::from_id_salt(("add_child", node.id().as_str()))
+                        .selected_text(candidate.as_str())
+                        .show_ui(ui, |ui| {
+                            for node_id in &node_ids {
+                                if node_id != node.id() {
+                                    ui.selectable_value(
+                                        &mut candidate,
+                                        node_id.clone(),
+                                        node_id.as_str(),
+                                    );
+                                }
+                            }
+                        });
+                    if ui.button("Append").clicked() && candidate != *node.id() {
+                        let mut appended = current_children.clone();
+                        appended.push(candidate);
+                        commands.write(AppCommand::SetCompositionChildren(
+                            node.id().clone(),
+                            appended,
+                        ));
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn render_literal_or_param_scalar(
+    ui: &mut egui::Ui,
+    node_id: &NodeId,
+    field: PrimitiveScalarField,
+    label: &str,
+    expr: &geom_scene::ScalarExpr,
+    editing_enabled: bool,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        match expr {
+            geom_scene::ScalarExpr::Literal(value) => {
+                let mut pending = *value;
+                let response = ui.add_enabled(
+                    editing_enabled,
+                    egui::DragValue::new(&mut pending)
+                        .speed(0.1)
+                        .range(0.0001..=10_000.0),
+                );
+                if response.changed() {
+                    commands.write(AppCommand::SetPrimitiveScalar(
+                        node_id.clone(),
+                        field,
+                        pending,
+                    ));
+                }
+            }
+            geom_scene::ScalarExpr::Parameter(parameter) => {
+                ui.label(format!("parameter-driven: {}", parameter.target()));
+            }
+        }
+    });
+}
+
+fn render_structural_editor(
+    ui: &mut egui::Ui,
+    app_model: &AppModel,
+    node_id: &NodeId,
+    editing_enabled: bool,
+    editor_state: &mut SceneEditorUiState,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Structure");
+    ui.horizontal(|ui| {
+        ui.label("Rename");
+        ui.add_enabled(
+            editing_enabled,
+            egui::TextEdit::singleline(&mut editor_state.rename_buffer),
+        );
+        if ui
+            .add_enabled(editing_enabled, egui::Button::new("Apply"))
+            .clicked()
+            && let Ok(next) = NodeId::new(editor_state.rename_buffer.trim())
+        {
+            commands.write(AppCommand::RenameNode(node_id.clone(), next));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Duplicate As");
+        ui.add_enabled(
+            editing_enabled,
+            egui::TextEdit::singleline(&mut editor_state.duplicate_buffer),
+        );
+        if ui
+            .add_enabled(editing_enabled, egui::Button::new("Duplicate"))
+            .clicked()
+            && let Ok(next) = NodeId::new(editor_state.duplicate_buffer.trim())
+        {
+            commands.write(AppCommand::DuplicateNode(node_id.clone(), next));
+        }
+    });
+    if ui
+        .add_enabled(editing_enabled, egui::Button::new("Set As Root Output"))
+        .clicked()
+    {
+        commands.write(AppCommand::SetRootNode(node_id.clone()));
+    }
+
+    if let Some(safety) = app_model.delete_node_safety(node_id) {
+        render_delete_safety(ui, &safety);
+        let can_delete = editing_enabled && !safety.is_root && safety.direct_dependents.is_empty();
+        if ui
+            .add_enabled(can_delete, egui::Button::new("Delete Node"))
+            .clicked()
+        {
+            commands.write(AppCommand::DeleteNode(node_id.clone()));
+        }
+    }
+}
+
+fn render_delete_safety(ui: &mut egui::Ui, safety: &DeleteNodeSafety) {
+    if safety.is_root {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "Deletion blocked: selected node is the root output.",
+        );
+    } else if !safety.direct_dependents.is_empty() {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            format!(
+                "Deletion blocked: directly referenced by {}",
+                join_node_ids(&safety.direct_dependents)
+            ),
+        );
+    } else {
+        ui.label("Deletion safe: node is currently unreferenced.");
+    }
+    if !safety.transitive_dependents.is_empty() {
+        ui.small(format!(
+            "Transitive dependents: {}",
+            join_node_ids(&safety.transitive_dependents)
+        ));
+    }
+}
+
+fn render_parameter_panel(
+    ui: &mut egui::Ui,
+    app_model: &AppModel,
+    editing_enabled: bool,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    ui.heading("Parameters");
+    let Some(scene) = app_model.current_scene() else {
+        return;
+    };
+    let tree = app_model.scene_tree_model();
+    for (parameter_id, definition) in scene.parameters() {
+        ui.separator();
+        ui.label(parameter_id.as_str());
+        if let Some(location) = app_model.parameter_source_location(parameter_id) {
+            ui.small(format!(
+                "source/scene.toml:{}:{}",
+                location.line, location.column
+            ));
+        }
+        let mut value = definition.scalar_value();
+        if ui
+            .add_enabled(
+                editing_enabled,
+                egui::DragValue::new(&mut value)
+                    .speed(0.1)
+                    .range(-10_000.0..=10_000.0),
+            )
+            .changed()
+        {
+            commands.write(AppCommand::SetParameterScalar(parameter_id.clone(), value));
+        }
+        if let Some(units) = definition
+            .extensions()
+            .entries()
+            .get("units")
+            .and_then(|value| match value {
+                geom_scene::ExtensionValue::String(text) => Some(text.as_str()),
+                _ => None,
+            })
+        {
+            ui.small(format!("Units: {units}"));
+        }
+        if let Some(tree) = &tree {
+            let direct = tree.parameter_dependents(parameter_id);
+            let transitive = tree.transitive_parameter_dependents(parameter_id);
+            ui.small(format!("Direct dependents: {}", join_node_ids(&direct)));
+            ui.small(format!(
+                "Transitive dependents: {}",
+                join_node_ids(&transitive)
+            ));
+        }
+    }
+}
+
+fn join_node_ids(node_ids: &[NodeId]) -> String {
+    if node_ids.is_empty() {
+        "none".to_owned()
+    } else {
+        node_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn next_suffixed_id(scene: &geom_scene::SceneDocument, base: &NodeId, suffix: &str) -> String {
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{}{suffix}{index}", base.as_str());
+        if !scene
+            .nodes()
+            .keys()
+            .any(|existing| existing.as_str() == candidate)
+        {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn node_kind_label(kind: &geom_scene::NodeKind) -> &'static str {
+    match kind {
+        geom_scene::NodeKind::Box(_) => "box",
+        geom_scene::NodeKind::Sphere(_) => "sphere",
+        geom_scene::NodeKind::Cylinder(_) => "cylinder",
+        geom_scene::NodeKind::Capsule(_) => "capsule",
+        geom_scene::NodeKind::Plane(_) => "plane",
+        geom_scene::NodeKind::Profile(_) => "profile",
+        geom_scene::NodeKind::Union(_) => "union",
+        geom_scene::NodeKind::Difference(_) => "difference",
+        geom_scene::NodeKind::Intersection(_) => "intersection",
+    }
 }
 
 fn camera_input_system(
@@ -604,66 +1429,53 @@ fn process_app_commands_system(
                 Ok(None) => {}
                 Err(error) => warn!("label edit failed: {error:?}"),
             },
-            AppCommand::RenameNode(from, to) => match app_model.rename_node(
-                from,
-                to,
-                EditOrigin::Gui,
-                Instant::now(),
-            ) {
-                Ok(Some(request)) => {
-                    viewport.selection.select(Some(to.clone()));
-                    dispatch_build_request(&mut runtime, request);
+            AppCommand::RenameNode(from, to) => {
+                match app_model.rename_node(from, to, EditOrigin::Gui, Instant::now()) {
+                    Ok(Some(request)) => {
+                        viewport.selection.select(Some(to.clone()));
+                        dispatch_build_request(&mut runtime, request);
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("rename failed: {error:?}"),
                 }
-                Ok(None) => {}
-                Err(error) => warn!("rename failed: {error:?}"),
-            },
-            AppCommand::DuplicateNode(source, duplicate) => match app_model.duplicate_node(
-                source,
-                duplicate,
-                EditOrigin::Gui,
-                Instant::now(),
-            ) {
-                Ok(Some(request)) => {
-                    viewport.selection.select(Some(duplicate.clone()));
-                    dispatch_build_request(&mut runtime, request);
+            }
+            AppCommand::DuplicateNode(source, duplicate) => {
+                match app_model.duplicate_node(source, duplicate, EditOrigin::Gui, Instant::now()) {
+                    Ok(Some(request)) => {
+                        viewport.selection.select(Some(duplicate.clone()));
+                        dispatch_build_request(&mut runtime, request);
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("duplicate failed: {error:?}"),
                 }
-                Ok(None) => {}
-                Err(error) => warn!("duplicate failed: {error:?}"),
-            },
-            AppCommand::DeleteNode(node) => match app_model.delete_node(
-                node,
-                EditOrigin::Gui,
-                Instant::now(),
-            ) {
-                Ok(Some(request)) => {
-                    viewport.selection.select(None);
-                    dispatch_build_request(&mut runtime, request);
+            }
+            AppCommand::DeleteNode(node) => {
+                match app_model.delete_node(node, EditOrigin::Gui, Instant::now()) {
+                    Ok(Some(request)) => {
+                        viewport.selection.select(None);
+                        dispatch_build_request(&mut runtime, request);
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("delete failed: {error:?}"),
                 }
-                Ok(None) => {}
-                Err(error) => warn!("delete failed: {error:?}"),
-            },
-            AppCommand::SetRootNode(node) => match app_model.set_root_node(
-                node,
-                EditOrigin::Gui,
-                Instant::now(),
-            ) {
-                Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
-                Ok(None) => {}
-                Err(error) => warn!("set root failed: {error:?}"),
-            },
-            AppCommand::AddNode(node, draft) => match app_model.add_node(
-                node,
-                draft.clone(),
-                EditOrigin::Gui,
-                Instant::now(),
-            ) {
-                Ok(Some(request)) => {
-                    viewport.selection.select(Some(node.clone()));
-                    dispatch_build_request(&mut runtime, request);
+            }
+            AppCommand::SetRootNode(node) => {
+                match app_model.set_root_node(node, EditOrigin::Gui, Instant::now()) {
+                    Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                    Ok(None) => {}
+                    Err(error) => warn!("set root failed: {error:?}"),
                 }
-                Ok(None) => {}
-                Err(error) => warn!("add node failed: {error:?}"),
-            },
+            }
+            AppCommand::AddNode(node, draft) => {
+                match app_model.add_node(node, draft.clone(), EditOrigin::Gui, Instant::now()) {
+                    Ok(Some(request)) => {
+                        viewport.selection.select(Some(node.clone()));
+                        dispatch_build_request(&mut runtime, request);
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("add node failed: {error:?}"),
+                }
+            }
             AppCommand::SetCompositionChildren(node, children) => match app_model
                 .set_composition_children(node, children, EditOrigin::Gui, Instant::now())
             {
@@ -994,6 +1806,15 @@ mod tests {
             .join("benchmark-reactive")
     }
 
+    fn authoring_smoke_workspace_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("workspaces")
+            .join("authoring-smoke")
+    }
+
     fn clone_workspace_fixture() -> PathBuf {
         clone_workspace_from(&smoke_workspace_path())
     }
@@ -1259,6 +2080,135 @@ mod tests {
             model
                 .drain_ready_file_event(Instant::now() + Duration::from_millis(75))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_safety_reports_root_and_referenced_nodes_conservatively() {
+        let model = smoke_load_workspace(smoke_workspace_path());
+        let root = model
+            .delete_node_safety(&NodeId::new("root").expect("root"))
+            .expect("root safety");
+        assert!(root.is_root);
+
+        let arm = model
+            .delete_node_safety(&NodeId::new("arm").expect("arm"))
+            .expect("arm safety");
+        assert!(!arm.is_root);
+        assert_eq!(
+            arm.direct_dependents,
+            vec![NodeId::new("union_shape").expect("dependent")]
+        );
+        assert!(
+            arm.transitive_dependents
+                .contains(&NodeId::new("root").expect("root dependent"))
+        );
+    }
+
+    #[test]
+    fn invalid_source_disables_canonical_gui_edits() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            workspace.replace_source("schema_version = 1\nroot = \"broken\"\n");
+            workspace.save().expect("save invalid");
+        }
+        let request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+
+        let result = model.set_node_label(
+            &NodeId::new("root").expect("id"),
+            Some("blocked"),
+            EditOrigin::Gui,
+            Instant::now(),
+        );
+        assert!(matches!(result, Err(AppEditError::Conflict(_))));
+    }
+
+    #[test]
+    fn selection_persists_across_unrelated_reload_and_falls_back_to_root_when_missing() {
+        let workspace_root = clone_workspace_from(&authoring_smoke_workspace_path());
+        let mut model = smoke_load_workspace(&workspace_root);
+        let mut selection = ViewportSelection {
+            selected_node: Some(NodeId::new("spare_sensor").expect("spare sensor")),
+        };
+
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            let updated = workspace
+                .source_text()
+                .replace("value = 1.6", "value = 1.9");
+            workspace.replace_source(updated);
+            workspace.save().expect("save unrelated edit");
+        }
+        let request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("manual rebuild");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+        model.preserve_selection(&mut selection);
+        assert_eq!(
+            selection.selected_node,
+            Some(NodeId::new("spare_sensor").expect("spare sensor"))
+        );
+
+        {
+            let workspace = model.workspace_mut().expect("workspace");
+            let source = workspace.source_text().to_owned();
+            let mut scene = geom_scene::SceneSource::parse(&source).expect("parse scene");
+            scene
+                .delete_node(&NodeId::new("spare_sensor").expect("spare sensor"))
+                .expect("delete spare sensor");
+            workspace.replace_source(scene.into_text());
+            workspace.save().expect("save deleted arm");
+        }
+        let request = model
+            .schedule_manual_rebuild(Instant::now())
+            .expect("manual rebuild");
+        let _ = model.accept_build_outcome(worker.process(request));
+        model.preserve_selection(&mut selection);
+        assert_eq!(
+            selection.selected_node,
+            Some(NodeId::new("assembly").expect("assembly"))
+        );
+    }
+
+    #[test]
+    fn parameter_value_edit_preserves_parameter_reference_after_reopen() {
+        let workspace_root = clone_workspace_fixture();
+        let mut model = smoke_load_workspace(&workspace_root);
+        let request = model
+            .set_parameter_scalar_value(
+                &ParamId::new("arm_length").expect("parameter"),
+                3.4,
+                EditOrigin::Gui,
+                Instant::now(),
+            )
+            .expect("set parameter")
+            .expect("request");
+        let mut worker = BuildWorker::new();
+        let _ = model.accept_build_outcome(worker.process(request));
+
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("reparse");
+        match reopened.nodes()[&NodeId::new("arm").expect("arm")].kind() {
+            geom_scene::NodeKind::Cylinder(cylinder) => {
+                assert!(matches!(
+                    cylinder.height,
+                    geom_scene::ScalarExpr::Parameter(_)
+                ));
+            }
+            other => panic!("unexpected arm kind: {other:?}"),
+        }
+        assert_eq!(
+            reopened.parameters()[&ParamId::new("arm_length").expect("parameter")].scalar_value(),
+            3.4
         );
     }
 

@@ -16,6 +16,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteNodeSafety {
+    pub is_root: bool,
+    pub direct_dependents: Vec<NodeId>,
+    pub transitive_dependents: Vec<NodeId>,
+}
+
 #[derive(Debug, Resource)]
 pub struct AppModel {
     workspace_path: Option<PathBuf>,
@@ -196,7 +203,9 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.set_parameter_scalar(parameter, value))
+        self.apply_scene_edit(origin, now, |source| {
+            source.set_parameter_scalar(parameter, value)
+        })
     }
 
     pub fn parameter_scalar(&self, parameter: &str) -> Option<f64> {
@@ -218,7 +227,19 @@ impl AppModel {
     }
 
     pub fn scene_tree_model(&self) -> Option<SceneTreeModel> {
-        self.last_good_scene.as_ref().map(SceneTreeModel::from_scene)
+        self.last_good_scene
+            .as_ref()
+            .map(SceneTreeModel::from_scene)
+    }
+
+    pub fn delete_node_safety(&self, node: &NodeId) -> Option<DeleteNodeSafety> {
+        let scene = self.last_good_scene.as_ref()?;
+        let tree = SceneTreeModel::from_scene(scene);
+        Some(DeleteNodeSafety {
+            is_root: scene.root() == node,
+            direct_dependents: tree.direct_dependents(node),
+            transitive_dependents: tree.transitive_dependents(node),
+        })
     }
 
     pub fn editing_disabled_reason(&self) -> Option<&str> {
@@ -266,7 +287,9 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.set_primitive_scalar(node, field, value))
+        self.apply_scene_edit(origin, now, |source| {
+            source.set_primitive_scalar(node, field, value)
+        })
     }
 
     pub fn set_node_label(
@@ -296,7 +319,9 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.duplicate_node(source_node, duplicate))
+        self.apply_scene_edit(origin, now, |source| {
+            source.duplicate_node(source_node, duplicate)
+        })
     }
 
     pub fn add_node(
@@ -325,7 +350,9 @@ impl AppModel {
         origin: EditOrigin,
         now: Instant,
     ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
-        self.apply_scene_edit(origin, now, |source| source.set_composition_children(node, children))
+        self.apply_scene_edit(origin, now, |source| {
+            source.set_composition_children(node, children)
+        })
     }
 
     pub fn delete_node(
@@ -584,7 +611,8 @@ impl AppModel {
             return Err(AppEditError::Conflict(message));
         }
 
-        let mut source = SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
+        let mut source =
+            SceneSource::parse(workspace.source_text()).map_err(AppEditError::Scene)?;
         edit(&mut source).map_err(AppEditError::Scene)?;
         let updated_text = source.into_text();
         if !workspace.replace_source(updated_text.clone()) {
