@@ -42,6 +42,39 @@ pub fn parse_scene(source: &str) -> Result<SceneDocument, SceneError> {
     scene_source.validate()
 }
 
+/// Serializes a semantic scene document into canonical TOML.
+pub fn serialize_scene(scene: &SceneDocument) -> String {
+    let mut document = DocumentMut::new();
+    document["schema_version"] = value(i64::from(scene.schema_version()));
+    document["root"] = value(scene.root().as_str());
+
+    if !scene.parameters().is_empty() {
+        let mut params = Table::new();
+        for parameter in scene.parameters().values() {
+            let mut parameter_table = Table::new();
+            parameter_table["type"] = value("scalar");
+            parameter_table["value"] = value(parameter.scalar_value());
+            if !parameter.extensions().is_empty() {
+                parameter_table["extensions"] = extension_item(parameter.extensions());
+            }
+            params.insert(parameter.id().as_str(), Item::Table(parameter_table));
+        }
+        document["params"] = Item::Table(params);
+    }
+
+    let mut nodes = Table::new();
+    for node in scene.nodes().values() {
+        nodes.insert(node.id().as_str(), Item::Table(node_table_from_node(node)));
+    }
+    document["nodes"] = Item::Table(nodes);
+
+    if !scene.extensions().is_empty() {
+        document["extensions"] = extension_item(scene.extensions());
+    }
+
+    document.to_string()
+}
+
 /// Establishes the M02 migration boundary for future schema upgrades.
 pub fn migrate_to_current(scene_source: SceneSource) -> Result<SceneSource, SceneError> {
     let version = scene_source.schema_version()?;

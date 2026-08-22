@@ -39,7 +39,7 @@
 
 use geom_scene::{
     Axis, Node, NodeId, NodeKind, ParamId, PrimitiveScalarField, ScalarExpr, SceneDocument,
-    SceneNodeDraft, SceneSource, TransformProperty,
+    SceneNodeDraft, SceneSource, TransformProperty, parse_scene, serialize_scene,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -49,6 +49,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -62,6 +63,8 @@ const WORKSPACE_HISTORY_DIR: &str = "history";
 const WORKSPACE_AI_DIR: &str = "ai";
 const WORKSPACE_HISTORY_FORMAT_VERSION: u32 = 1;
 const WORKSPACE_HISTORY_FILE_EXTENSION: &str = "toml";
+const WORKSPACE_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const WORKSPACE_SNAPSHOT_FILE_EXTENSION: &str = "snapshot.toml";
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_SUFFIX: &str = ".bak";
 
@@ -459,6 +462,29 @@ impl fmt::Display for OperationId {
     }
 }
 
+/// Stable snapshot identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SnapshotId(Uuid);
+
+impl SnapshotId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SnapshotId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SnapshotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The actor responsible for a structured workspace transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionActor {
@@ -471,6 +497,10 @@ pub enum TransactionActor {
 /// A typed semantic workspace operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceOp {
+    ReplaceScene {
+        id: OperationId,
+        scene: Box<SceneDocument>,
+    },
     AddNode {
         id: OperationId,
         node_id: NodeId,
@@ -532,7 +562,8 @@ impl WorkspaceOp {
     /// Returns the stable operation ID.
     pub fn id(&self) -> &OperationId {
         match self {
-            Self::AddNode { id, .. }
+            Self::ReplaceScene { id, .. }
+            | Self::AddNode { id, .. }
             | Self::ReplaceNode { id, .. }
             | Self::DeleteNode { id, .. }
             | Self::RenameNode { id, .. }
@@ -550,6 +581,12 @@ impl WorkspaceOp {
     pub fn affected_targets(&self) -> AffectedTargets {
         let mut targets = AffectedTargets::default();
         match self {
+            Self::ReplaceScene { scene, .. } => {
+                targets.node_ids.extend(scene.nodes().keys().cloned());
+                targets
+                    .parameter_ids
+                    .extend(scene.parameters().keys().cloned());
+            }
             Self::AddNode { node_id, .. }
             | Self::DeleteNode { node_id, .. }
             | Self::SetNodeLabel { node_id, .. }
@@ -583,6 +620,10 @@ impl WorkspaceOp {
 
     fn apply(&self, source: &mut SceneSource) -> Result<SceneDocument, geom_scene::SceneError> {
         match self {
+            Self::ReplaceScene { scene, .. } => {
+                *source = SceneSource::parse(&serialize_scene(scene))?;
+                source.validate()
+            }
             Self::AddNode { node_id, draft, .. } => source.add_node(node_id, draft.clone()),
             Self::ReplaceNode { node, .. } => source.set_node(node),
             Self::DeleteNode { node_id, .. } => source.delete_node(node_id),
@@ -622,6 +663,10 @@ impl WorkspaceOp {
 
     fn clone_with_new_id(&self) -> Self {
         match self {
+            Self::ReplaceScene { scene, .. } => Self::ReplaceScene {
+                id: OperationId::new(),
+                scene: scene.clone(),
+            },
             Self::AddNode { node_id, draft, .. } => Self::AddNode {
                 id: OperationId::new(),
                 node_id: node_id.clone(),
@@ -879,7 +924,13 @@ pub enum WorkspaceTransactionError {
     #[error("workspace transaction history persistence failed: {source}")]
     History {
         #[from]
-        source: WorkspaceHistoryError,
+        source: Box<WorkspaceHistoryError>,
+    },
+
+    #[error("workspace transaction snapshot persistence failed: {source}")]
+    Snapshot {
+        #[from]
+        source: Box<WorkspaceSnapshotError>,
     },
 
     #[error("workspace transaction cannot be inverted safely: {message}")]
@@ -987,10 +1038,13 @@ pub struct WorkspaceHistoryEntry {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    timestamp_millis: u64,
     revision_before: Revision,
     revision_after: Revision,
     affected_targets: AffectedTargets,
     operations: Vec<WorkspaceHistoryOperation>,
+    before_source_text: String,
+    source_text: String,
 }
 
 impl WorkspaceHistoryEntry {
@@ -1004,6 +1058,10 @@ impl WorkspaceHistoryEntry {
 
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
+    }
+
+    pub const fn timestamp_millis(&self) -> u64 {
+        self.timestamp_millis
     }
 
     pub const fn revision_before(&self) -> Revision {
@@ -1020,6 +1078,22 @@ impl WorkspaceHistoryEntry {
 
     pub fn operations(&self) -> &[WorkspaceHistoryOperation] {
         &self.operations
+    }
+
+    pub fn before_source_text(&self) -> &str {
+        &self.before_source_text
+    }
+
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
+    pub fn before_scene(&self) -> Result<SceneDocument, geom_scene::SceneError> {
+        parse_scene(&self.before_source_text)
+    }
+
+    pub fn scene(&self) -> Result<SceneDocument, geom_scene::SceneError> {
+        parse_scene(&self.source_text)
     }
 }
 
@@ -1078,6 +1152,254 @@ pub enum WorkspaceHistoryError {
         #[source]
         source: io::Error,
     },
+
+    #[error("workspace history scene state is invalid at {path}: {source}")]
+    InvalidSceneState {
+        path: PathBuf,
+        #[source]
+        source: Box<geom_scene::SceneError>,
+    },
+}
+
+/// Loaded snapshot metadata for list/read APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    id: SnapshotId,
+    name: String,
+    actor: TransactionActor,
+    created_from_revision: Revision,
+    created_at_millis: u64,
+    source_text: String,
+}
+
+impl WorkspaceSnapshot {
+    pub fn id(&self) -> &SnapshotId {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn actor(&self) -> TransactionActor {
+        self.actor
+    }
+
+    pub const fn created_from_revision(&self) -> Revision {
+        self.created_from_revision
+    }
+
+    pub const fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
+
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
+    pub fn scene(&self) -> Result<SceneDocument, geom_scene::SceneError> {
+        parse_scene(&self.source_text)
+    }
+}
+
+/// Typed failures while reading or writing snapshots.
+#[derive(Debug, Error)]
+pub enum WorkspaceSnapshotError {
+    #[error("workspace snapshot file name is invalid at {path}: {details}")]
+    InvalidFileName { path: PathBuf, details: String },
+
+    #[error(
+        "workspace snapshot format version {found} is unsupported at {path}; supported version is {supported}"
+    )]
+    UnsupportedFormatVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("workspace snapshot is malformed at {path}: {details}")]
+    MalformedSnapshot { path: PathBuf, details: String },
+
+    #[error("workspace snapshot is truncated or partially written at {path}")]
+    PartialSnapshot { path: PathBuf },
+
+    #[error("workspace snapshot I/O failed at {path} during {operation}: {source}")]
+    Io {
+        path: PathBuf,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("workspace snapshot scene state is invalid at {path}: {source}")]
+    InvalidSceneState {
+        path: PathBuf,
+        #[source]
+        source: Box<geom_scene::SceneError>,
+    },
+}
+
+/// Filters for project-owned history queries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryQuery {
+    revision: Option<Revision>,
+    actor: Option<TransactionActor>,
+    node_id: Option<NodeId>,
+    parameter_id: Option<ParamId>,
+    time_range: Option<TimeRange>,
+}
+
+impl HistoryQuery {
+    pub fn by_revision(revision: Revision) -> Self {
+        Self {
+            revision: Some(revision),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_actor(actor: TransactionActor) -> Self {
+        Self {
+            actor: Some(actor),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_node(node_id: NodeId) -> Self {
+        Self {
+            node_id: Some(node_id),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_parameter(parameter_id: ParamId) -> Self {
+        Self {
+            parameter_id: Some(parameter_id),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_time_range(time_range: TimeRange) -> Self {
+        Self {
+            time_range: Some(time_range),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_actor(mut self, actor: TransactionActor) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+
+    pub fn with_node(mut self, node_id: NodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
+    }
+
+    pub fn with_parameter(mut self, parameter_id: ParamId) -> Self {
+        self.parameter_id = Some(parameter_id);
+        self
+    }
+
+    pub fn with_time_range(mut self, time_range: TimeRange) -> Self {
+        self.time_range = Some(time_range);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeRange {
+    start_millis: u64,
+    end_millis: u64,
+}
+
+impl TimeRange {
+    pub fn new(start_millis: u64, end_millis: u64) -> Self {
+        Self {
+            start_millis,
+            end_millis,
+        }
+    }
+
+    fn contains(self, timestamp_millis: u64) -> bool {
+        self.start_millis <= timestamp_millis && timestamp_millis <= self.end_millis
+    }
+}
+
+/// Structured semantic diff between two workspace scene states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceSceneDiff {
+    before_revision: Revision,
+    after_revision: Revision,
+    affected_targets: AffectedTargets,
+    changes: Vec<WorkspaceSceneChange>,
+    summary: String,
+}
+
+impl WorkspaceSceneDiff {
+    pub const fn before_revision(&self) -> Revision {
+        self.before_revision
+    }
+
+    pub const fn after_revision(&self) -> Revision {
+        self.after_revision
+    }
+
+    pub fn affected_targets(&self) -> &AffectedTargets {
+        &self.affected_targets
+    }
+
+    pub fn changes(&self) -> &[WorkspaceSceneChange] {
+        &self.changes
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceSceneChange {
+    RootChanged {
+        before: NodeId,
+        after: NodeId,
+    },
+    ParameterAdded {
+        id: ParamId,
+        value: f64,
+    },
+    ParameterRemoved {
+        id: ParamId,
+        value: f64,
+    },
+    ParameterChanged {
+        id: ParamId,
+        before: f64,
+        after: f64,
+    },
+    NodeAdded {
+        id: NodeId,
+        kind: &'static str,
+    },
+    NodeRemoved {
+        id: NodeId,
+        kind: &'static str,
+    },
+    NodeChanged {
+        id: NodeId,
+        before_kind: &'static str,
+        after_kind: &'static str,
+        fields: Vec<NodeChangeField>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeChangeField {
+    Label,
+    Kind,
+    Transform,
+    CompositionChildren,
+    PrimitiveShape,
+    Extensions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1086,11 +1408,14 @@ struct WorkspaceHistoryFile {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    timestamp_millis: u64,
     revision_before: u64,
     revision_after: u64,
     affected_node_ids: Vec<String>,
     affected_parameter_ids: Vec<String>,
     operations: Vec<WorkspaceHistoryOperationFile>,
+    before_source_text: String,
+    source_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,6 +1425,17 @@ struct WorkspaceHistoryOperationFile {
     summary: String,
     affected_node_ids: Vec<String>,
     affected_parameter_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceSnapshotFile {
+    format_version: u32,
+    snapshot_id: SnapshotId,
+    name: String,
+    actor: TransactionActor,
+    created_from_revision: u64,
+    created_at_millis: u64,
+    source_text: String,
 }
 
 impl Workspace {
@@ -1291,10 +1627,16 @@ impl Workspace {
                 transaction,
                 revision_before,
                 Revision(revision_before.get() + 2),
+                self.source_text.clone(),
+                updated_text.clone(),
             );
             let mut staged = self.clone();
             staged.replace_source(updated_text);
-            let history_path = staged.write_history_entry(&history)?;
+            let history_path = staged.write_history_entry(&history).map_err(|source| {
+                WorkspaceTransactionError::History {
+                    source: Box::new(source),
+                }
+            })?;
             if let Err(source_error) = staged.save() {
                 let _ = remove_history_entry_file(&history_path);
                 return Err(source_error.into());
@@ -1322,6 +1664,195 @@ impl Workspace {
     /// Loads durable transaction history entries in chronological revision order.
     pub fn history_entries(&self) -> Result<Vec<WorkspaceHistoryEntry>, WorkspaceHistoryError> {
         read_history_entries(self.paths.history_dir())
+    }
+
+    /// Queries durable history entries using simple project-owned filters.
+    pub fn query_history(
+        &self,
+        query: &HistoryQuery,
+    ) -> Result<Vec<WorkspaceHistoryEntry>, WorkspaceHistoryError> {
+        let entries = self.history_entries()?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| history_entry_matches_query(entry, query))
+            .collect())
+    }
+
+    /// Creates and persists a named workspace snapshot.
+    pub fn create_snapshot(
+        &self,
+        name: impl Into<String>,
+        actor: TransactionActor,
+    ) -> Result<WorkspaceSnapshot, WorkspaceSnapshotError> {
+        let name = normalize_snapshot_name(name.into()).map_err(|message| {
+            WorkspaceSnapshotError::MalformedSnapshot {
+                path: self.paths.history_dir(),
+                details: message,
+            }
+        })?;
+        let file = WorkspaceSnapshotFile::from_workspace(
+            SnapshotId::new(),
+            name,
+            actor,
+            self.revision,
+            self.source_text.clone(),
+        );
+        let path = snapshot_entry_path(&self.paths.history_dir(), &file.snapshot_id);
+        let text = toml::to_string_pretty(&file).map_err(|error| {
+            WorkspaceSnapshotError::MalformedSnapshot {
+                path: path.clone(),
+                details: error.to_string(),
+            }
+        })?;
+        write_snapshot_file(&path, text.as_bytes())?;
+        file.into_snapshot(&path)
+    }
+
+    /// Lists persisted snapshots in creation order.
+    pub fn snapshots(&self) -> Result<Vec<WorkspaceSnapshot>, WorkspaceSnapshotError> {
+        read_snapshots(self.paths.history_dir())
+    }
+
+    /// Reads one persisted snapshot by ID.
+    pub fn snapshot(
+        &self,
+        snapshot_id: &SnapshotId,
+    ) -> Result<WorkspaceSnapshot, WorkspaceSnapshotError> {
+        read_snapshot(self.paths.history_dir(), snapshot_id)
+    }
+
+    /// Restores a snapshot by applying a new structured transaction.
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot_id: &SnapshotId,
+        actor: TransactionActor,
+    ) -> Result<WorkspaceTransactionCommit, WorkspaceTransactionError> {
+        let snapshot =
+            self.snapshot(snapshot_id)
+                .map_err(|source| WorkspaceTransactionError::Snapshot {
+                    source: Box::new(source),
+                })?;
+        let transaction = WorkspaceTransaction::new(
+            actor,
+            Some(format!("Restore snapshot {}", snapshot.name())),
+            vec![WorkspaceOp::ReplaceScene {
+                id: OperationId::new(),
+                scene: Box::new(snapshot.scene()?),
+            }],
+        )?;
+        self.apply_transaction(&transaction)
+    }
+
+    /// Produces a structured semantic diff for one committed transaction.
+    pub fn transaction_diff(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<Option<WorkspaceSceneDiff>, WorkspaceHistoryError> {
+        let entries = self.history_entries()?;
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.transaction_id() == transaction_id)
+        else {
+            return Ok(None);
+        };
+        let after =
+            entries[index]
+                .scene()
+                .map_err(|source| WorkspaceHistoryError::InvalidSceneState {
+                    path: history_entry_path(
+                        &self.paths.history_dir(),
+                        entries[index].revision_after(),
+                        entries[index].transaction_id(),
+                    ),
+                    source: Box::new(source),
+                })?;
+        if entries[index].before_source_text().trim().is_empty() {
+            return Ok(Some(diff_from_empty_scene(
+                entries[index].revision_before(),
+                entries[index].revision_after(),
+                &after,
+            )));
+        }
+        let before = entries[index].before_scene().map_err(|source| {
+            WorkspaceHistoryError::InvalidSceneState {
+                path: history_entry_path(
+                    &self.paths.history_dir(),
+                    entries[index].revision_after(),
+                    entries[index].transaction_id(),
+                ),
+                source: Box::new(source),
+            }
+        })?;
+        Ok(Some(diff_scenes(
+            entries[index].revision_before(),
+            entries[index].revision_after(),
+            &before,
+            &after,
+        )))
+    }
+
+    /// Compares current canonical scene state to a stored snapshot.
+    pub fn compare_current_to_snapshot(
+        &self,
+        snapshot_id: &SnapshotId,
+    ) -> Result<WorkspaceSceneDiff, WorkspaceSnapshotError> {
+        let snapshot = self.snapshot(snapshot_id)?;
+        let current = parse_scene(&self.source_text).map_err(|source| {
+            WorkspaceSnapshotError::InvalidSceneState {
+                path: self.paths.source_file(),
+                source: Box::new(source),
+            }
+        })?;
+        let snapshot_scene =
+            snapshot
+                .scene()
+                .map_err(|source| WorkspaceSnapshotError::InvalidSceneState {
+                    path: snapshot_entry_path(&self.paths.history_dir(), snapshot.id()),
+                    source: Box::new(source),
+                })?;
+        Ok(diff_scenes(
+            snapshot.created_from_revision(),
+            self.revision,
+            &snapshot_scene,
+            &current,
+        ))
+    }
+
+    /// Compares current canonical scene state to one historical committed revision.
+    pub fn compare_current_to_revision(
+        &self,
+        revision: Revision,
+    ) -> Result<Option<WorkspaceSceneDiff>, WorkspaceHistoryError> {
+        let Some(history) = self
+            .query_history(&HistoryQuery::by_revision(revision))?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let current = parse_scene(&self.source_text).map_err(|source| {
+            WorkspaceHistoryError::InvalidSceneState {
+                path: self.paths.source_file(),
+                source: Box::new(source),
+            }
+        })?;
+        let previous =
+            history
+                .scene()
+                .map_err(|source| WorkspaceHistoryError::InvalidSceneState {
+                    path: history_entry_path(
+                        &self.paths.history_dir(),
+                        history.revision_after(),
+                        history.transaction_id(),
+                    ),
+                    source: Box::new(source),
+                })?;
+        Ok(Some(diff_scenes(
+            history.revision_after(),
+            self.revision,
+            &previous,
+            &current,
+        )))
     }
 
     /// Returns ordered change sets recorded after the supplied revision.
@@ -1493,11 +2024,20 @@ fn normalize_transaction_intent(intent: Option<String>) -> Option<String> {
     })
 }
 
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl WorkspaceHistoryFile {
     fn from_transaction(
         transaction: &WorkspaceTransaction,
         revision_before: Revision,
         revision_after: Revision,
+        before_source_text: String,
+        source_text: String,
     ) -> Self {
         let affected_targets = transaction.affected_targets();
         Self {
@@ -1505,6 +2045,7 @@ impl WorkspaceHistoryFile {
             transaction_id: transaction.id().clone(),
             actor: transaction.actor(),
             intent: transaction.intent.clone(),
+            timestamp_millis: current_time_millis(),
             revision_before: revision_before.get(),
             revision_after: revision_after.get(),
             affected_node_ids: affected_targets
@@ -1522,6 +2063,8 @@ impl WorkspaceHistoryFile {
                 .iter()
                 .map(WorkspaceHistoryOperationFile::from_operation)
                 .collect(),
+            before_source_text,
+            source_text,
         }
     }
 
@@ -1538,6 +2081,7 @@ impl WorkspaceHistoryFile {
             transaction_id: self.transaction_id,
             actor: self.actor,
             intent: self.intent,
+            timestamp_millis: self.timestamp_millis,
             revision_before: Revision(self.revision_before),
             revision_after: Revision(self.revision_after),
             affected_targets: affected_targets_from_strings(
@@ -1550,6 +2094,52 @@ impl WorkspaceHistoryFile {
                 .into_iter()
                 .map(|operation| operation.into_operation(path))
                 .collect::<Result<Vec<_>, _>>()?,
+            before_source_text: self.before_source_text,
+            source_text: self.source_text,
+        })
+    }
+}
+
+impl WorkspaceSnapshotFile {
+    fn from_workspace(
+        snapshot_id: SnapshotId,
+        name: String,
+        actor: TransactionActor,
+        created_from_revision: Revision,
+        source_text: String,
+    ) -> Self {
+        Self {
+            format_version: WORKSPACE_SNAPSHOT_FORMAT_VERSION,
+            snapshot_id,
+            name,
+            actor,
+            created_from_revision: created_from_revision.get(),
+            created_at_millis: current_time_millis(),
+            source_text,
+        }
+    }
+
+    fn into_snapshot(self, path: &Path) -> Result<WorkspaceSnapshot, WorkspaceSnapshotError> {
+        if self.format_version != WORKSPACE_SNAPSHOT_FORMAT_VERSION {
+            return Err(WorkspaceSnapshotError::UnsupportedFormatVersion {
+                path: path.to_path_buf(),
+                found: self.format_version,
+                supported: WORKSPACE_SNAPSHOT_FORMAT_VERSION,
+            });
+        }
+        parse_scene(&self.source_text).map_err(|source| {
+            WorkspaceSnapshotError::InvalidSceneState {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?;
+        Ok(WorkspaceSnapshot {
+            id: self.snapshot_id,
+            name: self.name,
+            actor: self.actor,
+            created_from_revision: Revision(self.created_from_revision),
+            created_at_millis: self.created_at_millis,
+            source_text: self.source_text,
         })
     }
 }
@@ -1612,6 +2202,10 @@ fn capture_inverse_operation(
     operation: &WorkspaceOp,
 ) -> Result<WorkspaceOp, WorkspaceTransactionError> {
     match operation {
+        WorkspaceOp::ReplaceScene { .. } => Ok(WorkspaceOp::ReplaceScene {
+            id: OperationId::new(),
+            scene: Box::new(scene.clone()),
+        }),
         WorkspaceOp::AddNode { node_id, .. } => Ok(WorkspaceOp::DeleteNode {
             id: OperationId::new(),
             node_id: node_id.clone(),
@@ -1833,12 +2427,20 @@ fn read_history_entries(
             source,
         })?;
         let path = dir_entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with(TEMP_SUFFIX)
+            && !file_name.ends_with(WORKSPACE_SNAPSHOT_FILE_EXTENSION)
+        {
+            return Err(WorkspaceHistoryError::PartialEntry { path });
+        }
+        if file_name.ends_with(WORKSPACE_SNAPSHOT_FILE_EXTENSION) {
+            continue;
+        }
         let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
             continue;
         };
-        if extension == TEMP_SUFFIX.trim_start_matches('.') {
-            return Err(WorkspaceHistoryError::PartialEntry { path });
-        }
         if extension != WORKSPACE_HISTORY_FILE_EXTENSION {
             continue;
         }
@@ -1863,6 +2465,67 @@ fn read_history_entries(
     Ok(entries.into_iter().map(|(_, entry)| entry).collect())
 }
 
+fn read_snapshots(history_dir: PathBuf) -> Result<Vec<WorkspaceSnapshot>, WorkspaceSnapshotError> {
+    if !history_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for dir_entry in fs::read_dir(&history_dir).map_err(|source| WorkspaceSnapshotError::Io {
+        path: history_dir.clone(),
+        operation: "read snapshot directory",
+        source,
+    })? {
+        let dir_entry = dir_entry.map_err(|source| WorkspaceSnapshotError::Io {
+            path: history_dir.clone(),
+            operation: "iterate snapshot directory",
+            source,
+        })?;
+        let path = dir_entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with(TEMP_SUFFIX) && file_name.contains(".snapshot.") {
+            return Err(WorkspaceSnapshotError::PartialSnapshot { path });
+        }
+        if !file_name.ends_with(WORKSPACE_SNAPSHOT_FILE_EXTENSION) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|source| WorkspaceSnapshotError::Io {
+            path: path.clone(),
+            operation: "read snapshot file",
+            source,
+        })?;
+        let snapshot_file: WorkspaceSnapshotFile =
+            toml::from_str(&text).map_err(|error| WorkspaceSnapshotError::MalformedSnapshot {
+                path: path.clone(),
+                details: error.to_string(),
+            })?;
+        entries.push(snapshot_file.into_snapshot(&path)?);
+    }
+
+    entries.sort_by_key(|snapshot| (snapshot.created_at_millis(), snapshot.id().to_string()));
+    Ok(entries)
+}
+
+fn read_snapshot(
+    history_dir: PathBuf,
+    snapshot_id: &SnapshotId,
+) -> Result<WorkspaceSnapshot, WorkspaceSnapshotError> {
+    let path = snapshot_entry_path(&history_dir, snapshot_id);
+    let text = fs::read_to_string(&path).map_err(|source| WorkspaceSnapshotError::Io {
+        path: path.clone(),
+        operation: "read snapshot file",
+        source,
+    })?;
+    let snapshot_file: WorkspaceSnapshotFile =
+        toml::from_str(&text).map_err(|error| WorkspaceSnapshotError::MalformedSnapshot {
+            path: path.clone(),
+            details: error.to_string(),
+        })?;
+    snapshot_file.into_snapshot(&path)
+}
+
 fn history_entry_path(
     history_dir: &Path,
     revision_after: Revision,
@@ -1873,6 +2536,13 @@ fn history_entry_path(
         revision_after.get(),
         transaction_id,
         WORKSPACE_HISTORY_FILE_EXTENSION
+    ))
+}
+
+fn snapshot_entry_path(history_dir: &Path, snapshot_id: &SnapshotId) -> PathBuf {
+    history_dir.join(format!(
+        "{snapshot_id}.{}",
+        WORKSPACE_SNAPSHOT_FILE_EXTENSION
     ))
 }
 
@@ -1922,6 +2592,30 @@ fn write_history_file(path: &Path, bytes: &[u8]) -> Result<(), WorkspaceHistoryE
     })
 }
 
+fn write_snapshot_file(path: &Path, bytes: &[u8]) -> Result<(), WorkspaceSnapshotError> {
+    let parent = path.parent().ok_or_else(|| WorkspaceSnapshotError::Io {
+        path: path.to_path_buf(),
+        operation: "resolve snapshot parent directory",
+        source: io::Error::other("snapshot file has no parent directory"),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| WorkspaceSnapshotError::Io {
+        path: parent.to_path_buf(),
+        operation: "create snapshot parent directories",
+        source,
+    })?;
+    let temp_path = temp_path_for(path);
+    fs::write(&temp_path, bytes).map_err(|source| WorkspaceSnapshotError::Io {
+        path: temp_path.clone(),
+        operation: "write snapshot temporary file",
+        source,
+    })?;
+    fs::rename(&temp_path, path).map_err(|source| WorkspaceSnapshotError::Io {
+        path: path.to_path_buf(),
+        operation: "promote snapshot temporary file",
+        source,
+    })
+}
+
 fn remove_history_entry_file(path: &Path) -> Result<(), WorkspaceHistoryError> {
     fs::remove_file(path).map_err(|source| WorkspaceHistoryError::Io {
         path: path.to_path_buf(),
@@ -1959,6 +2653,7 @@ fn affected_targets_from_strings(
 
 fn history_operation_kind(operation: &WorkspaceOp) -> &'static str {
     match operation {
+        WorkspaceOp::ReplaceScene { .. } => "replace_scene",
         WorkspaceOp::AddNode { .. } => "add_node",
         WorkspaceOp::ReplaceNode { .. } => "replace_node",
         WorkspaceOp::DeleteNode { .. } => "delete_node",
@@ -1975,6 +2670,7 @@ fn history_operation_kind(operation: &WorkspaceOp) -> &'static str {
 
 fn history_kind_static(path: &Path, kind: &str) -> Result<&'static str, WorkspaceHistoryError> {
     match kind {
+        "replace_scene" => Ok("replace_scene"),
         "add_node" => Ok("add_node"),
         "replace_node" => Ok("replace_node"),
         "delete_node" => Ok("delete_node"),
@@ -1995,6 +2691,11 @@ fn history_kind_static(path: &Path, kind: &str) -> Result<&'static str, Workspac
 
 fn history_operation_summary(operation: &WorkspaceOp) -> String {
     match operation {
+        WorkspaceOp::ReplaceScene { scene, .. } => format!(
+            "Replace full scene with {} nodes and {} parameters",
+            scene.nodes().len(),
+            scene.parameters().len()
+        ),
         WorkspaceOp::AddNode { node_id, draft, .. } => {
             format!("Add node `{}` as {draft:?}", node_id.as_str())
         }
@@ -2064,6 +2765,242 @@ fn history_operation_summary(operation: &WorkspaceOp) -> String {
             format!("Set root node to `{}`", node_id.as_str())
         }
     }
+}
+
+fn normalize_snapshot_name(name: String) -> Result<String, String> {
+    let normalized = name.trim().to_owned();
+    if normalized.is_empty() {
+        return Err("snapshot name must not be empty".to_owned());
+    }
+    Ok(normalized)
+}
+
+fn history_entry_matches_query(entry: &WorkspaceHistoryEntry, query: &HistoryQuery) -> bool {
+    if let Some(revision) = query.revision
+        && entry.revision_after() != revision
+    {
+        return false;
+    }
+    if let Some(actor) = query.actor
+        && entry.actor() != actor
+    {
+        return false;
+    }
+    if let Some(node_id) = query.node_id.as_ref()
+        && !entry.affected_targets().node_ids().contains(node_id)
+    {
+        return false;
+    }
+    if let Some(parameter_id) = query.parameter_id.as_ref()
+        && !entry
+            .affected_targets()
+            .parameter_ids()
+            .contains(parameter_id)
+    {
+        return false;
+    }
+    if let Some(time_range) = query.time_range
+        && !time_range.contains(entry.timestamp_millis())
+    {
+        return false;
+    }
+    true
+}
+
+fn diff_scenes(
+    before_revision: Revision,
+    after_revision: Revision,
+    before: &SceneDocument,
+    after: &SceneDocument,
+) -> WorkspaceSceneDiff {
+    let mut affected_targets = AffectedTargets::default();
+    let mut changes = Vec::new();
+
+    if before.root() != after.root() {
+        affected_targets.node_ids.insert(before.root().clone());
+        affected_targets.node_ids.insert(after.root().clone());
+        changes.push(WorkspaceSceneChange::RootChanged {
+            before: before.root().clone(),
+            after: after.root().clone(),
+        });
+    }
+
+    for (id, before_parameter) in before.parameters() {
+        match after.parameters().get(id) {
+            None => {
+                affected_targets.parameter_ids.insert(id.clone());
+                changes.push(WorkspaceSceneChange::ParameterRemoved {
+                    id: id.clone(),
+                    value: before_parameter.scalar_value(),
+                });
+            }
+            Some(after_parameter)
+                if before_parameter.scalar_value() != after_parameter.scalar_value() =>
+            {
+                affected_targets.parameter_ids.insert(id.clone());
+                changes.push(WorkspaceSceneChange::ParameterChanged {
+                    id: id.clone(),
+                    before: before_parameter.scalar_value(),
+                    after: after_parameter.scalar_value(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for (id, after_parameter) in after.parameters() {
+        if !before.parameters().contains_key(id) {
+            affected_targets.parameter_ids.insert(id.clone());
+            changes.push(WorkspaceSceneChange::ParameterAdded {
+                id: id.clone(),
+                value: after_parameter.scalar_value(),
+            });
+        }
+    }
+
+    for (id, before_node) in before.nodes() {
+        match after.nodes().get(id) {
+            None => {
+                affected_targets.node_ids.insert(id.clone());
+                changes.push(WorkspaceSceneChange::NodeRemoved {
+                    id: id.clone(),
+                    kind: node_kind_name(before_node.kind()),
+                });
+            }
+            Some(after_node) if before_node != after_node => {
+                affected_targets.node_ids.insert(id.clone());
+                changes.push(WorkspaceSceneChange::NodeChanged {
+                    id: id.clone(),
+                    before_kind: node_kind_name(before_node.kind()),
+                    after_kind: node_kind_name(after_node.kind()),
+                    fields: diff_node_fields(before_node, after_node),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for (id, after_node) in after.nodes() {
+        if !before.nodes().contains_key(id) {
+            affected_targets.node_ids.insert(id.clone());
+            changes.push(WorkspaceSceneChange::NodeAdded {
+                id: id.clone(),
+                kind: node_kind_name(after_node.kind()),
+            });
+        }
+    }
+
+    let summary = summarize_scene_changes(&changes);
+    WorkspaceSceneDiff {
+        before_revision,
+        after_revision,
+        affected_targets,
+        changes,
+        summary,
+    }
+}
+
+fn diff_from_empty_scene(
+    after_revision_before: Revision,
+    after_revision: Revision,
+    after: &SceneDocument,
+) -> WorkspaceSceneDiff {
+    let mut affected_targets = AffectedTargets::default();
+    let mut changes = Vec::new();
+    affected_targets.node_ids.insert(after.root().clone());
+    changes.push(WorkspaceSceneChange::RootChanged {
+        before: after.root().clone(),
+        after: after.root().clone(),
+    });
+    for (id, parameter) in after.parameters() {
+        affected_targets.parameter_ids.insert(id.clone());
+        changes.push(WorkspaceSceneChange::ParameterAdded {
+            id: id.clone(),
+            value: parameter.scalar_value(),
+        });
+    }
+    for (id, node) in after.nodes() {
+        affected_targets.node_ids.insert(id.clone());
+        changes.push(WorkspaceSceneChange::NodeAdded {
+            id: id.clone(),
+            kind: node_kind_name(node.kind()),
+        });
+    }
+    let summary = summarize_scene_changes(&changes);
+    WorkspaceSceneDiff {
+        before_revision: after_revision_before,
+        after_revision,
+        affected_targets,
+        changes,
+        summary,
+    }
+}
+
+fn diff_node_fields(before: &Node, after: &Node) -> Vec<NodeChangeField> {
+    let mut fields = Vec::new();
+    if before.label() != after.label() {
+        fields.push(NodeChangeField::Label);
+    }
+    if before.kind() != after.kind() {
+        fields.push(NodeChangeField::Kind);
+        if node_kind_name(before.kind()) == node_kind_name(after.kind()) {
+            match (before.kind(), after.kind()) {
+                (NodeKind::Union(before_comp), NodeKind::Union(after_comp))
+                | (NodeKind::Difference(before_comp), NodeKind::Difference(after_comp))
+                | (NodeKind::Intersection(before_comp), NodeKind::Intersection(after_comp))
+                    if before_comp.children != after_comp.children =>
+                {
+                    fields.push(NodeChangeField::CompositionChildren);
+                }
+                _ => fields.push(NodeChangeField::PrimitiveShape),
+            }
+        }
+    } else {
+        match (before.kind(), after.kind()) {
+            (NodeKind::Union(before_comp), NodeKind::Union(after_comp))
+            | (NodeKind::Difference(before_comp), NodeKind::Difference(after_comp))
+            | (NodeKind::Intersection(before_comp), NodeKind::Intersection(after_comp))
+                if before_comp.children != after_comp.children =>
+            {
+                fields.push(NodeChangeField::CompositionChildren);
+            }
+            (before_kind, after_kind) if before_kind != after_kind => {
+                fields.push(NodeChangeField::PrimitiveShape);
+            }
+            _ => {}
+        }
+    }
+    if before.transform() != after.transform() {
+        fields.push(NodeChangeField::Transform);
+    }
+    if before.extensions() != after.extensions() {
+        fields.push(NodeChangeField::Extensions);
+    }
+    fields
+}
+
+fn summarize_scene_changes(changes: &[WorkspaceSceneChange]) -> String {
+    if changes.is_empty() {
+        return "No semantic scene changes".to_owned();
+    }
+    let mut added_nodes = 0;
+    let mut removed_nodes = 0;
+    let mut changed_nodes = 0;
+    let mut changed_parameters = 0;
+    let mut root_changes = 0;
+    for change in changes {
+        match change {
+            WorkspaceSceneChange::RootChanged { .. } => root_changes += 1,
+            WorkspaceSceneChange::ParameterAdded { .. }
+            | WorkspaceSceneChange::ParameterRemoved { .. }
+            | WorkspaceSceneChange::ParameterChanged { .. } => changed_parameters += 1,
+            WorkspaceSceneChange::NodeAdded { .. } => added_nodes += 1,
+            WorkspaceSceneChange::NodeRemoved { .. } => removed_nodes += 1,
+            WorkspaceSceneChange::NodeChanged { .. } => changed_nodes += 1,
+        }
+    }
+    format!(
+        "{} root changes, {} parameter changes, {} nodes added, {} nodes removed, {} nodes changed",
+        root_changes, changed_parameters, added_nodes, removed_nodes, changed_nodes
+    )
 }
 
 fn normalize_relative_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -3385,11 +4322,30 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
             r#"format_version = 99
 transaction_id = "00000000-0000-0000-0000-000000000001"
 actor = "User"
+timestamp_millis = 1
 revision_before = 0
 revision_after = 2
 affected_node_ids = []
 affected_parameter_ids = []
 operations = []
+before_source_text = """
+schema_version = 1
+root = "root"
+
+[nodes.root]
+kind = "sphere"
+radius = 1.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"""
+source_text = """
+schema_version = 1
+root = "root"
+
+[nodes.root]
+kind = "sphere"
+radius = 1.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"""
 "#,
         )
         .expect("write unsupported");
@@ -3478,5 +4434,259 @@ operations = []
 
         assert!(matches!(error, WorkspaceTransactionError::Workspace { .. }));
         assert!(workspace.history_entries().expect("history").is_empty());
+    }
+
+    #[test]
+    fn create_list_and_read_snapshot_persist_across_reopen() {
+        let workspace = transaction_workspace();
+        let snapshot = workspace
+            .create_snapshot("Initial checkpoint", TransactionActor::User)
+            .expect("create snapshot");
+        assert_eq!(snapshot.name(), "Initial checkpoint");
+        assert_eq!(snapshot.actor(), TransactionActor::User);
+        assert_eq!(snapshot.created_from_revision(), workspace.revision());
+
+        let snapshots = workspace.snapshots().expect("list snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0], snapshot);
+
+        let reread = workspace.snapshot(snapshot.id()).expect("read snapshot");
+        assert_eq!(reread, snapshot);
+
+        let reopened = Workspace::open(workspace.root()).expect("reopen");
+        let reopened_snapshots = reopened.snapshots().expect("reopened snapshots");
+        assert_eq!(reopened_snapshots, snapshots);
+    }
+
+    #[test]
+    fn restore_snapshot_creates_new_transaction_and_restores_scene() {
+        let mut workspace = transaction_workspace();
+        let before = geom_scene::parse_scene(workspace.source_text()).expect("before");
+        let snapshot = workspace
+            .create_snapshot("Before change", TransactionActor::User)
+            .expect("snapshot");
+
+        workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Mutate after snapshot".to_owned()),
+                    vec![
+                        WorkspaceOp::SetParameterScalar {
+                            id: OperationId::new(),
+                            parameter_id: ParamId::new("width").expect("width"),
+                            value: 9.0,
+                        },
+                        WorkspaceOp::RenameNode {
+                            id: OperationId::new(),
+                            from: NodeId::new("cap").expect("cap"),
+                            to: NodeId::new("top").expect("top"),
+                        },
+                    ],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply mutation");
+
+        let restore_commit = workspace
+            .restore_snapshot(snapshot.id(), TransactionActor::User)
+            .expect("restore snapshot");
+        assert_eq!(restore_commit.actor(), TransactionActor::User);
+        assert_eq!(
+            restore_commit.intent(),
+            Some("Restore snapshot Before change")
+        );
+
+        let restored = geom_scene::parse_scene(workspace.source_text()).expect("restored");
+        assert_eq!(restored, before);
+
+        let history = workspace.history_entries().expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].intent(), Some("Restore snapshot Before change"));
+        assert_eq!(history[1].operations()[0].kind(), "replace_scene");
+    }
+
+    #[test]
+    fn history_queries_filter_by_revision_actor_node_parameter_and_time() {
+        let mut workspace = transaction_workspace();
+        let width = ParamId::new("width").expect("width");
+        let body = NodeId::new("body").expect("body");
+
+        let first_commit = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Change width".to_owned()),
+                    vec![WorkspaceOp::SetParameterScalar {
+                        id: OperationId::new(),
+                        parameter_id: width.clone(),
+                        value: 4.0,
+                    }],
+                )
+                .expect("first tx"),
+            )
+            .expect("apply first");
+        let second_commit = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::Ai,
+                    Some("Relabel body".to_owned()),
+                    vec![WorkspaceOp::SetNodeLabel {
+                        id: OperationId::new(),
+                        node_id: body.clone(),
+                        label: Some("AI".to_owned()),
+                    }],
+                )
+                .expect("second tx"),
+            )
+            .expect("apply second");
+
+        let all = workspace.history_entries().expect("history");
+        let first_time = all[0].timestamp_millis();
+        let second_time = all[1].timestamp_millis();
+
+        assert_eq!(
+            workspace
+                .query_history(&HistoryQuery::by_revision(first_commit.revision_after()))
+                .expect("revision query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .query_history(&HistoryQuery::by_actor(TransactionActor::Ai))
+                .expect("actor query")[0]
+                .transaction_id(),
+            second_commit.transaction_id()
+        );
+        assert_eq!(
+            workspace
+                .query_history(&HistoryQuery::by_node(body))
+                .expect("node query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .query_history(&HistoryQuery::by_parameter(width))
+                .expect("parameter query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .query_history(&HistoryQuery::by_time_range(TimeRange::new(
+                    first_time,
+                    second_time,
+                )))
+                .expect("time query")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn transaction_diff_and_comparisons_are_semantic_and_summarized() {
+        let mut workspace = transaction_workspace();
+        let snapshot = workspace
+            .create_snapshot("Baseline", TransactionActor::User)
+            .expect("snapshot");
+
+        let commit = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Change body and width".to_owned()),
+                    vec![
+                        WorkspaceOp::SetParameterScalar {
+                            id: OperationId::new(),
+                            parameter_id: ParamId::new("width").expect("width"),
+                            value: 5.5,
+                        },
+                        WorkspaceOp::SetNodeLabel {
+                            id: OperationId::new(),
+                            node_id: NodeId::new("body").expect("body"),
+                            label: Some("Body 2".to_owned()),
+                        },
+                    ],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply tx");
+
+        let diff = workspace
+            .transaction_diff(commit.transaction_id())
+            .expect("transaction diff")
+            .expect("diff exists");
+        assert_eq!(diff.before_revision(), commit.revision_before());
+        assert_eq!(diff.after_revision(), commit.revision_after());
+        assert!(!diff.changes().is_empty());
+        assert!(diff.summary().contains("parameter changes"));
+
+        let snapshot_diff = workspace
+            .compare_current_to_snapshot(snapshot.id())
+            .expect("snapshot diff");
+        assert_eq!(
+            snapshot_diff.before_revision(),
+            snapshot.created_from_revision()
+        );
+        assert_eq!(snapshot_diff.after_revision(), workspace.revision());
+        assert!(!snapshot_diff.changes().is_empty());
+
+        let revision_diff = workspace
+            .compare_current_to_revision(commit.revision_after())
+            .expect("revision diff");
+        assert!(revision_diff.is_some());
+        assert_eq!(
+            revision_diff.expect("diff").summary(),
+            "No semantic scene changes"
+        );
+    }
+
+    #[test]
+    fn malformed_and_unsupported_snapshots_return_typed_errors() {
+        let workspace = transaction_workspace();
+        let history_dir = workspace.paths().history_dir();
+
+        fs::write(history_dir.join("bad.snapshot.toml"), "not valid toml = [")
+            .expect("write malformed snapshot");
+        match workspace
+            .snapshots()
+            .expect_err("malformed snapshot should fail")
+        {
+            WorkspaceSnapshotError::MalformedSnapshot { .. } => {}
+            other => panic!("unexpected malformed snapshot error: {other:?}"),
+        }
+        fs::remove_file(history_dir.join("bad.snapshot.toml")).expect("cleanup malformed snapshot");
+
+        fs::write(
+            history_dir.join("bad-version.snapshot.toml"),
+            r#"format_version = 99
+snapshot_id = "00000000-0000-0000-0000-000000000001"
+name = "Bad"
+actor = "User"
+created_from_revision = 0
+created_at_millis = 1
+source_text = """
+schema_version = 1
+root = "root"
+
+[nodes.root]
+kind = "sphere"
+radius = 1.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"""
+"#,
+        )
+        .expect("write unsupported snapshot");
+        match workspace
+            .snapshots()
+            .expect_err("unsupported snapshot should fail")
+        {
+            WorkspaceSnapshotError::UnsupportedFormatVersion { found, .. } => assert_eq!(found, 99),
+            other => panic!("unexpected unsupported snapshot error: {other:?}"),
+        }
+        fs::remove_file(history_dir.join("bad-version.snapshot.toml"))
+            .expect("cleanup unsupported snapshot");
     }
 }

@@ -1,46 +1,64 @@
-# Morphos Workspace Transactions (M07 Tranche 3)
+# Morphos Workspace Transactions (M07 Final)
 
 ## Goal
 
-M07 introduces a project-owned structured mutation boundary between GUI/automation callers and the
+M07 establishes a project-owned semantic mutation boundary between GUI/automation callers and the
 canonical TOML-backed workspace state.
 
-This milestone now adds:
+The final M07 architecture now includes:
 
 - typed `WorkspaceOp` scene mutations
 - atomic `WorkspaceTransaction` grouping
-- transaction actor and optional human-readable intent
-- affected-target reporting for `NodeId` and `ParamId`
-- one coherent commit record returned for each accepted transaction
-- durable per-transaction history entries in `.morphos/history`
-- typed history read errors for malformed, unsupported, or partial entries
-
-It still does not add snapshots, restore flows, or full before/after diffs.
+- actor and intent metadata
+- in-memory transaction-level undo/redo
+- durable per-transaction history
+- named snapshots
+- restore-through-transaction semantics
+- simple project-owned history queries
+- semantic transaction diffs and current-vs-history comparisons
 
 ## Operation model
 
-`geom_workspace` now owns the structured mutation entry point through:
+`geom_workspace` owns the structured mutation boundary through:
 
 - `WorkspaceOp`
 - `WorkspaceTransaction`
 - `WorkspaceTransactionCommit`
 - `TransactionActor`
-- stable `OperationId` and `TransactionId`
+- stable `OperationId`, `TransactionId`, and `SnapshotId`
 
-Current scene-oriented operations cover the M06 authoring surface:
+Current scene-oriented operations cover the M06 authoring surface plus semantic full-state restore:
 
-- add node
-- delete node
-- rename node
-- duplicate node
-- set node label
-- set composition children
-- set parameter scalar
-- set transform component
-- set primitive scalar
-- set root node
+- `AddNode`
+- `ReplaceNode`
+- `DeleteNode`
+- `RenameNode`
+- `DuplicateNode`
+- `SetNodeLabel`
+- `SetCompositionChildren`
+- `SetParameterScalar`
+- `SetTransformComponent`
+- `SetPrimitiveScalar`
+- `SetRootNode`
+- `ReplaceScene`
 
-These operations are semantic changes, not arbitrary text replacement requests.
+`ReplaceScene` is intentionally narrow: it exists to support truthful snapshot restore and semantic
+revision comparison without fabricating arbitrary text diffs.
+
+## Workspace metadata decision
+
+Workspace metadata mutations intentionally remain outside `WorkspaceOp`.
+
+Reasons:
+
+- M07’s structured transaction boundary is primarily about semantic scene state.
+- workspace name/description already have direct workspace-owned APIs
+- metadata changes do not need to be forced into scene-history transactions to make scene editing,
+  undo/redo, snapshots, or semantic diffs reliable
+
+If a later milestone needs durable metadata provenance unified with scene history, Morphos can add a
+separate metadata transaction surface then. M07 does not require it to complete the scene/history
+architecture.
 
 ## Transaction model
 
@@ -48,189 +66,199 @@ A `WorkspaceTransaction` contains:
 
 - one stable transaction ID
 - one actor
-- an optional intent/summary string
-- an ordered list of typed operations
+- an optional human-readable intent/summary
+- an ordered list of typed semantic operations
 
 Transactions are rejected if they contain no operations.
 
-## Undo / Redo model
-
-Undo and redo operate at transaction granularity.
-
-One original committed transaction is treated as one reversible unit. If a transaction contained
-multiple dependent operations, undo reverses them coherently as one inverse transaction rather than
-leaving partially undone intermediate states visible.
-
-The current in-memory owner is `UndoRedoManager`, which maintains:
-
-- an undo stack of committed reversible transactions
-- a redo stack of undone transactions
-
-Rules in this tranche:
-
-- a successful new commit is pushed onto the undo stack
-- undo moves that transaction record to the redo stack
-- redo reapplies the original forward transaction and returns it to the undo stack
-- any new non-redo commit after an undo clears the redo stack
-- external source reloads clear both stacks because they bypass structured in-memory provenance
-
-Undo and redo themselves now also emit durable history entries because they reuse the same
-structured transaction path with fresh transaction and operation IDs plus explicit undo/redo
-intent text.
-
-## Validation and atomicity
-
-Transactions are applied through `Workspace::apply_transaction`.
-
-The workflow is:
+Transactions are applied through `Workspace::apply_transaction`:
 
 1. parse the current canonical source into `SceneSource`
-2. apply every `WorkspaceOp` to that temporary source
-3. stop immediately if any operation fails validation
-4. persist the final source once only after every operation succeeds
-5. return one `WorkspaceTransactionCommit` summary, including the captured inverse transaction
+2. validate the current semantic scene
+3. apply every `WorkspaceOp` against a temporary source copy
+4. capture inverse operations from the pre-operation semantic state
+5. stage the final canonical source write
+6. persist one durable history entry
+7. save canonical source normally
+8. return one coherent commit record
 
-Because canonical workspace state is not mutated until the full transaction validates, one bad
-operation prevents partial mutation from reaching observers or disk.
+Canonical workspace state is only swapped into the live workspace after the staged transaction
+persists successfully.
 
-Undo and redo reuse the same transaction application path, so they preserve the same atomicity
-guarantees.
+## Undo / Redo
 
-## Inverse capture strategy
+Undo and redo operate at transaction granularity through the in-memory `UndoRedoManager`.
 
-Inverse operations are captured while the forward transaction is being validated and applied.
+Rules:
 
-For each forward operation, Morphos inspects the semantic scene state that exists immediately
-before that operation runs and derives the inverse operation from that pre-operation state.
+- a successful new commit is pushed onto the undo stack
+- undo applies one inverse transaction and moves that record to redo
+- redo reapplies the original forward transaction and returns it to undo
+- any new non-redo commit after undo clears redo
+- external source reloads clear both stacks because they bypass in-memory structured provenance
 
-Examples:
+Undo and redo reuse the normal transaction application path, so they also create new durable audit
+history entries with fresh IDs and explicit undo/redo intent text.
 
-- `AddNode` inverse is `DeleteNode`
-- `DeleteNode` inverse is a full-node restore operation using the exact semantic node previously
-  present
-- `RenameNode A -> B` inverse is `RenameNode B -> A`
-- parameter/transform/primitive/label/root edits capture the old semantic value exactly
-- composition child edits capture the prior ordered child list exactly
-
-For multi-operation transactions, inverse operations are applied in reverse order. This is
-important when later operations depend on earlier ones, such as rename-then-edit or
-rename-then-reference-update workflows.
-
-## SceneSource integration
-
-`geom_workspace` does not reimplement TOML editing itself.
-
-Instead, each `WorkspaceOp` delegates to the source-preserving mutation APIs already owned by
-`geom_scene::SceneSource`. That preserves the M02/M06 source-authority boundary while moving the
-structured mutation boundary up to the workspace layer.
-
-Conceptually:
-
-`caller -> WorkspaceTransaction -> WorkspaceOp[] -> SceneSource -> Workspace save`
-
-## Actor and intent
-
-Current transaction actors are:
-
-- `User`
-- `Ai`
-- `CliAutomation`
-- `SystemMigration`
-
-Intent is an optional trimmed human-readable summary. It is returned in the commit record and is
-also persisted into the durable history entry for later inspection.
-
-Undo and redo currently reissue transactions with fresh IDs and fresh operation IDs while carrying
-explicit undo/redo intent text for later provenance expansion.
+Persistent restartable undo stacks are intentionally out of scope for M07.
 
 ## Durable history
 
-Committed source-changing transactions now write one project-owned versioned history file under:
+Committed source-changing transactions are persisted under:
 
 `<workspace>/.morphos/history/<revision>-<transaction-id>.toml`
 
+Each history entry is project-owned, versioned, and independent of egui/Bevy.
+
 Each entry records:
 
-- format version
+- history format version
 - transaction ID
 - actor
 - optional intent
+- timestamp in milliseconds since Unix epoch
 - revision before and after commit
 - affected node IDs and parameter IDs
 - per-operation IDs
 - per-operation kind strings and concise summaries
+- canonical pre-transaction source text
+- canonical post-transaction source text
 
-Entries are sorted by revision/file name for chronological reads through
-`Workspace::history_entries()`.
+The stored before/after canonical source texts let Morphos produce exact semantic diffs for one
+transaction and compare current state against a historical committed revision without pretending raw
+text diffs are the semantic model.
 
-The history layer stays independent of egui and Bevy. It lives entirely in `geom_workspace`.
+## Snapshot layout
 
-## History robustness and failure policy
+Named snapshots are persisted in the same reserved history area:
 
-History entries are written before the staged source save is finalized, but the live in-memory
-workspace is only swapped into place after both history and source persistence succeed.
+`<workspace>/.morphos/history/<snapshot-id>.snapshot.toml`
 
-Current policy:
+Each snapshot records:
 
-- if history entry persistence fails, the transaction fails and canonical source is left untouched
-- if source persistence fails after a new history entry is written, Morphos removes that new
-  history entry before returning the source persistence error
-- history readers return typed errors for malformed entries, unsupported format versions, invalid
-  file naming, and leftover `.tmp` partial files
+- snapshot format version
+- stable snapshot ID
+- human-readable name
+- actor
+- creation time in milliseconds since Unix epoch
+- source revision the snapshot was created from
+- canonical source text sufficient for faithful restore
 
-This keeps canonical scene state conservative and avoids silently accepting unaudited edits, while
-remaining simple enough for deterministic tests.
+Snapshots are listed through `Workspace::snapshots()` and loaded through `Workspace::snapshot(...)`.
+
+## Snapshot restore semantics
+
+Snapshot restore never silently overwrites the workspace.
+
+Restore flow:
+
+`snapshot -> SceneDocument -> WorkspaceOp::ReplaceScene -> WorkspaceTransaction -> apply_transaction -> durable history -> canonical save`
+
+That means restore:
+
+- reuses normal scene validation
+- reuses normal persistence and atomicity rules
+- emits a new history entry
+- preserves the audit trail of the restore event itself
+
+## History query API
+
+M07 adds simple presentation-neutral history queries through:
+
+- `Workspace::history_entries()`
+- `Workspace::query_history(&HistoryQuery)`
+
+Supported filters:
+
+- revision
+- actor
+- `NodeId`
+- `ParamId`
+- time range
+
+The API intentionally remains simple iterator/filter style rather than introducing a database or
+query language.
+
+## Semantic diff model
+
+Morphos now exposes semantic scene diffs through `WorkspaceSceneDiff`.
+
+Each diff includes:
+
+- before revision
+- after revision
+- affected `NodeId`s
+- affected `ParamId`s
+- structured semantic changes
+- one concise human-readable summary
+
+Current structured change kinds include:
+
+- root change
+- parameter add/remove/change
+- node add/remove
+- node change with structured changed-field categories such as label, transform, composition
+  children, primitive shape, kind, and extensions
+
+The diff model is semantic and project-owned. Raw text diffs are not the canonical explanation of a
+workspace change.
+
+## Comparison API
+
+M07 supports comparing current canonical state against:
+
+- one persisted snapshot through `Workspace::compare_current_to_snapshot(...)`
+- one historical committed revision through `Workspace::compare_current_to_revision(...)`
+- one committed transaction through `Workspace::transaction_diff(...)`
+
+Historical revision comparison is exact because durable history stores the canonical post-commit
+source text for each committed revision.
 
 ## External-edit policy
 
-Raw external TOML edits are intentionally outside durable transaction history in this tranche.
+Raw external TOML edits are intentionally outside durable transaction history in M07.
 
 When Morphos observes an external source reload, it:
 
-- reloads the canonical source text
-- clears the in-memory undo/redo stacks
-- does not synthesize fake `WorkspaceOp` history entries from the text diff
+- reloads canonical source text
+- clears in-memory undo/redo
+- does not synthesize fake semantic `WorkspaceOp` history from the raw text change
 
-That boundary is conservative on purpose. Morphos does not yet have a reliable semantic derivation
-step that can turn arbitrary external text edits into truthful structured transaction provenance, so
-this tranche leaves those edits outside the durable audit log instead of fabricating misleading
-history.
+That boundary is conservative on purpose. Morphos does not yet have a trustworthy semantic derivation
+step for arbitrary external text edits.
 
-## Affected targets
+## Robustness and failure policy
 
-Each operation reports its affected mutation targets, and the transaction commit returns their
-union:
+Current durability policy:
 
-- affected `NodeId`s
-- affected `ParamId`s
+- if history entry persistence fails, the transaction fails and canonical source remains untouched
+- if source persistence fails after a new history entry is written, Morphos removes that new
+  history entry before returning the source persistence error
+- malformed, unsupported, or partial history entries return typed `WorkspaceHistoryError`s
+- malformed, unsupported, or partial snapshot files return typed `WorkspaceSnapshotError`s
 
-This is the minimal structured change summary needed by the transaction foundation. Rich structured
-diffs remain later M07 work.
+Morphos uses simple versioned files appropriate to the existing workspace architecture rather than a
+database or VCS.
 
-## M06 GUI integration
+## GUI integration
 
-`geom_app::AppModel` now routes canonical GUI scene edits through the transaction layer instead of
-calling ad hoc `SceneSource` closures directly.
+`geom_app::AppModel` routes canonical GUI scene edits through `WorkspaceTransaction` rather than ad
+hoc scene-text rewrites.
 
-The current flow is:
+Current flow:
 
 `egui -> AppCommand -> AppModel -> WorkspaceTransaction -> Workspace::apply_transaction -> SceneSource -> Workspace save -> M05 reactive rebuild`
 
-M05 conflict checking and own-write suppression remain unchanged. The GUI still verifies the
-on-disk fingerprint before committing a transaction so stale external edits are not overwritten.
+Undo/redo uses that same path and does not bypass the existing watcher/build boundary.
 
-`geom_app` now exposes simple Undo / Redo actions through the authoring UI and app-facing
-availability state via `UndoRedoAvailability`.
+## M07 boundary
 
-Undo/redo saves source normally, triggers one normal reactive rebuild, and does not bypass the
-existing watcher/build separation.
+M07 is complete at the workspace/history layer.
 
-## Future M07 boundary
+Still intentionally out of scope:
 
-Still intentionally not implemented in this tranche:
-
-- snapshot creation/restoration
-- history queries
-- full structured before/after diffs
-
-Those build on this transaction foundation rather than bypassing it.
+- M08 functionality
+- database-backed history
+- branching version-control behavior
+- geometry-level diffs
+- productized history UI/CLI beyond the current programmatic APIs

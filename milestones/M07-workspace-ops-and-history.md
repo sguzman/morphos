@@ -18,7 +18,7 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 - [x] Include operations for add/delete/replace node.
 - [x] Include operations for rename/reparent/reference changes.
 - [x] Include operations for parameter and transform changes.
-- [ ] Include operations for workspace metadata changes where appropriate.
+- [x] Re-evaluate workspace metadata changes and keep them outside scene transactions when they do not belong.
 - [x] Give every operation a stable operation ID.
 
 ### Transactions
@@ -41,17 +41,17 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 ### History and snapshots
 
 - [x] Persist a lightweight history log.
-- [ ] Add named snapshots/checkpoints.
-- [ ] Restore a snapshot as a new transaction rather than silently replacing history.
-- [ ] Allow history queries by revision, actor, node, and time.
+- [x] Add named snapshots/checkpoints.
+- [x] Restore a snapshot as a new transaction rather than silently replacing history.
+- [x] Allow history queries by revision, actor, node, and time.
 - [x] Keep history format versioned.
 
 ### Diff model
 
-- [ ] Produce a structured before/after diff for a transaction.
-- [ ] Produce concise human-readable summaries from structured diffs.
+- [x] Produce a structured before/after diff for a transaction.
+- [x] Produce concise human-readable summaries from structured diffs.
 - [x] Expose affected node IDs and parameter paths.
-- [ ] Support comparing current state to a snapshot/revision.
+- [x] Support comparing current state to a snapshot/revision.
 
 ### Tests
 
@@ -59,19 +59,26 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 - [x] Add transaction atomicity tests.
 - [x] Add undo/redo round-trip tests.
 - [x] Add actor/provenance persistence tests.
-- [ ] Add snapshot restore tests.
-- [ ] Add structured diff tests.
+- [x] Add snapshot restore tests.
+- [x] Add structured diff tests.
 
 ## Notes
 
-- The first three M07 tranches now cover the transaction foundation, in-memory transaction-level
-  undo/redo, and a durable per-transaction history log with actor/intent/target provenance.
-- The current operation surface matches the M06 authoring mutations and now includes an explicit
-  full-node replacement operation. Workspace-metadata transaction operations remain future work if
-  they become necessary.
+- M07 now covers the transaction foundation, in-memory transaction-level undo/redo, durable
+  per-transaction history, named snapshots, simple history queries, semantic diff/comparison APIs,
+  and restore-via-transaction.
+- The current operation surface matches the M06 authoring mutations and now includes explicit
+  full-node and full-scene replacement operations. Workspace metadata remains outside
+  `WorkspaceOp`: metadata edits already have a coherent workspace-level API, are not part of the
+  scene semantic mutation surface, and do not need to be forced into scene-history transactions to
+  satisfy M07.
 - Undo/redo still operates on in-memory structured transaction records and clears redo on any new
-  post-undo commit rather than branching redo state, but undo/redo commits are now also captured in
+  post-undo commit rather than branching redo state, but undo/redo commits are also captured in
   durable history through the normal transaction path.
+
+## Status
+
+- M07 is complete. Remaining future work belongs to later milestones rather than this one.
 
 ## Completion criteria
 
