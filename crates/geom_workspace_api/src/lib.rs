@@ -626,7 +626,7 @@ impl WorkspaceApi {
             filtered_diagnostics(workspace, node_id.as_ref(), parameter_id.as_ref());
         if let Some(severity) = filter.severity.as_deref() {
             diagnostics.retain(|diagnostic| {
-                serde_json::to_value(&diagnostic.severity)
+                serde_json::to_value(diagnostic.severity)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .map(|value| value == severity)
