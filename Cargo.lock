@@ -2944,6 +2944,7 @@ dependencies = [
  "geom_geometry",
  "geom_scene",
  "geom_workspace",
+ "image",
  "notify",
  "serde",
  "serde_json",

@@ -32,10 +32,10 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### Preview/render export
 
-- [ ] Add a headless or offscreen preview image path if renderer support allows it cleanly.
-- [ ] Allow camera framing presets or automatic fit.
-- [ ] Return/render diagnostic failure cleanly in headless use.
-- [ ] Keep image rendering optional so geometry export remains usable on systems without it.
+- [x] Add a headless or offscreen preview image path if renderer support allows it cleanly.
+- [x] Allow camera framing presets or automatic fit.
+- [x] Return/render diagnostic failure cleanly in headless use.
+- [x] Keep image rendering optional so geometry export remains usable on systems without it.
 
 ### Structured operation tooling
 

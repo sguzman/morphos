@@ -1,3 +1,5 @@
+use crate::camera::{CameraFrame, OrbitCameraState};
+use bevy::prelude::{EulerRot, Quat, Vec3};
 use geom_geometry::{BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh};
 use geom_scene::{Node, NodeId, ParamId, SceneDocument, parse_scene};
 use geom_workspace::{
@@ -5,6 +7,7 @@ use geom_workspace::{
     WorkspaceHistoryEntry, WorkspaceOp, WorkspaceSceneChange, WorkspaceSceneDiff,
     WorkspaceSnapshot, WorkspaceTransaction, WorkspaceTransactionCommit,
 };
+use image::{ImageBuffer, Rgba};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -114,6 +117,15 @@ enum Command {
         snapshot_id: SnapshotId,
         format: OutputFormat,
     },
+    Preview {
+        workspace: PathBuf,
+        output: Option<NodeId>,
+        destination: Option<PathBuf>,
+        width: u32,
+        height: u32,
+        overwrite: bool,
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +186,15 @@ struct TransactionExecutionRecord {
     mode: &'static str,
     commit: WorkspaceTransactionCommit,
     diff: Option<WorkspaceSceneDiff>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewRenderRecord {
+    relative_path: PathBuf,
+    absolute_path: PathBuf,
+    width: u32,
+    height: u32,
+    byte_count: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,6 +365,8 @@ where
     let mut destination: Option<PathBuf> = None;
     let mut mesh_format = MeshExportFormat::Obj;
     let mut overwrite = false;
+    let mut preview_width = 1280u32;
+    let mut preview_height = 720u32;
     let mut file: Option<PathBuf> = None;
     let mut actor_filter: Option<TransactionActor> = None;
     let mut parameter_filter: Option<ParamId> = None;
@@ -402,6 +425,28 @@ where
             "--overwrite" => {
                 overwrite = true;
                 index += 1;
+            }
+            "--width" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!(
+                        "missing value for `--width`\n\n{}",
+                        usage(&program)
+                    ));
+                };
+                let raw = value.to_string_lossy();
+                preview_width = parse_u32_flag(raw.as_ref(), "--width", &program)?;
+                index += 2;
+            }
+            "--height" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!(
+                        "missing value for `--height`\n\n{}",
+                        usage(&program)
+                    ));
+                };
+                let raw = value.to_string_lossy();
+                preview_height = parse_u32_flag(raw.as_ref(), "--height", &program)?;
+                index += 2;
             }
             "--file" => {
                 let Some(value) = collected.get(index + 1) else {
@@ -520,9 +565,17 @@ where
             overwrite,
             format: output_format,
         }),
+        "preview" => Ok(Command::Preview {
+            workspace,
+            output: requested_output,
+            destination,
+            width: preview_width,
+            height: preview_height,
+            overwrite,
+            format: output_format,
+        }),
         "history" => {
             if requested_output.is_some()
-                || destination.is_some()
                 || file.is_some()
                 || snapshot_name.is_some()
                 || snapshot_id.is_some()
@@ -846,7 +899,7 @@ fn parse_snapshot_command(collected: &[OsString], program: &str) -> Result<Comma
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj|stl] [--destination <relative-path>] [--overwrite] [--json]\n  {program} tx apply <workspace> --file <transaction.json> [--json]\n  {program} tx dry-run <workspace> --file <transaction.json> [--json]\n  {program} history <workspace> [--actor <actor>] [--node <node-id>] [--parameter <param-id>] [--json]\n  {program} snapshot create <workspace> --name <snapshot-name> [--json]\n  {program} snapshot list <workspace> [--json]\n  {program} snapshot restore <workspace> --id <snapshot-id> [--json]"
+        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj|stl] [--destination <relative-path>] [--overwrite] [--json]\n  {program} preview <workspace> [--output <node-id>] [--destination <relative-path>] [--width <px>] [--height <px>] [--overwrite] [--json]\n  {program} tx apply <workspace> --file <transaction.json> [--json]\n  {program} tx dry-run <workspace> --file <transaction.json> [--json]\n  {program} history <workspace> [--actor <actor>] [--node <node-id>] [--parameter <param-id>] [--json]\n  {program} snapshot create <workspace> --name <snapshot-name> [--json]\n  {program} snapshot list <workspace> [--json]\n  {program} snapshot restore <workspace> --id <snapshot-id> [--json]"
     )
 }
 
@@ -928,6 +981,39 @@ fn execute_command(command: Command) -> Result<String, CliError> {
                     "scene": scene_json(&scene),
                     "evaluation": evaluated_geometry_json(&evaluation),
                     "export": export_record_json(&export),
+                }),
+            )
+        }
+        Command::Preview {
+            workspace,
+            output,
+            destination,
+            width,
+            height,
+            overwrite,
+            format,
+        } => {
+            let workspace = open_workspace(&workspace)?;
+            let scene = parse_workspace_scene(&workspace)?;
+            let evaluation = evaluate_scene(&scene, output.as_ref())?;
+            let preview = render_preview_image(
+                &workspace,
+                &evaluation,
+                destination.as_deref(),
+                width,
+                height,
+                overwrite,
+            )?;
+            render_output(
+                format,
+                render_preview_text(&workspace, &scene, &evaluation, &preview),
+                json!({
+                    "command": "preview",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "scene": scene_json(&scene),
+                    "evaluation": evaluated_geometry_json(&evaluation),
+                    "preview": preview_record_json(&preview),
                 }),
             )
         }
@@ -1084,6 +1170,18 @@ fn parse_param_id(raw: &str, flag: &str, program: &str) -> Result<ParamId, Strin
 fn parse_snapshot_id(raw: &str, program: &str) -> Result<SnapshotId, String> {
     serde_json::from_value::<SnapshotId>(Value::String(raw.to_owned()))
         .map_err(|error| format!("invalid snapshot ID `{raw}`: {error}\n\n{}", usage(program)))
+}
+
+fn parse_u32_flag(raw: &str, flag: &str, program: &str) -> Result<u32, String> {
+    raw.parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            format!(
+                "invalid positive integer for `{flag}`: `{raw}`\n\n{}",
+                usage(program)
+            )
+        })
 }
 
 fn load_transaction_file(path: &Path) -> Result<WorkspaceTransaction, CliError> {
@@ -1492,6 +1590,267 @@ fn read_history(
         })?
     };
     Ok(entries)
+}
+
+fn render_preview_image(
+    workspace: &Workspace,
+    evaluation: &EvaluatedGeometry,
+    destination: Option<&Path>,
+    width: u32,
+    height: u32,
+    overwrite: bool,
+) -> Result<PreviewRenderRecord, CliError> {
+    let relative_path = match destination {
+        Some(path) => workspace
+            .resolve_path(WorkspaceDirectory::Exports, path)
+            .map_err(|error| {
+                CliError::new(
+                    CliExitCode::Io,
+                    format!("invalid preview destination `{}`: {error}", path.display()),
+                )
+            })?
+            .strip_prefix(workspace.paths().exports_dir())
+            .expect("resolved preview path stays under exports dir")
+            .to_path_buf(),
+        None => PathBuf::from(format!("{}.png", evaluation.requested_output.as_str())),
+    };
+    let absolute_path = workspace
+        .resolve_path(WorkspaceDirectory::Exports, &relative_path)
+        .map_err(|error| {
+            CliError::new(
+                CliExitCode::Io,
+                format!(
+                    "failed to resolve preview path `{}`: {error}",
+                    relative_path.display()
+                ),
+            )
+        })?;
+    if absolute_path.exists() && !overwrite {
+        return Err(CliError::new(
+            CliExitCode::Io,
+            format!(
+                "preview destination already exists at `{}`; pass `--overwrite` to replace it",
+                absolute_path.display()
+            ),
+        ));
+    }
+    let parent = absolute_path.parent().ok_or_else(|| {
+        CliError::new(
+            CliExitCode::Internal,
+            format!(
+                "preview destination `{}` has no parent directory",
+                absolute_path.display()
+            ),
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        CliError::new(
+            CliExitCode::Io,
+            format!(
+                "failed to create preview directory `{}`: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+
+    let image = rasterize_preview(&evaluation.mesh, &evaluation.bounds, width, height);
+    image.save(&absolute_path).map_err(|error| {
+        CliError::new(
+            CliExitCode::Io,
+            format!(
+                "failed to write preview `{}`: {error}",
+                absolute_path.display()
+            ),
+        )
+    })?;
+    let byte_count = fs::metadata(&absolute_path)
+        .map_err(|error| {
+            CliError::new(
+                CliExitCode::Io,
+                format!(
+                    "failed to read preview metadata `{}`: {error}",
+                    absolute_path.display()
+                ),
+            )
+        })?
+        .len();
+    Ok(PreviewRenderRecord {
+        relative_path,
+        absolute_path,
+        width,
+        height,
+        byte_count,
+    })
+}
+
+fn rasterize_preview(
+    mesh: &Mesh,
+    bounds: &Bounds,
+    width: u32,
+    height: u32,
+) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let mut image = ImageBuffer::from_pixel(width, height, Rgba([247, 245, 240, 255]));
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut depth = vec![f32::INFINITY; pixel_count];
+
+    let aspect_ratio = width as f32 / height.max(1) as f32;
+    let mut camera = OrbitCameraState::default();
+    camera.frame_bounds(bounds, aspect_ratio);
+    let frame = CameraFrame::from_bounds(bounds, aspect_ratio);
+    camera.apply_frame(frame);
+
+    let rotation = Quat::from_euler(EulerRot::YXZ, camera.yaw, camera.pitch, 0.0);
+    let camera_position = camera.target + rotation * Vec3::new(0.0, 0.0, camera.distance);
+    let forward = (camera.target - camera_position).normalize_or_zero();
+    let right = forward.cross(Vec3::Y).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let light_dir = Vec3::new(0.35, 0.8, 0.45).normalize();
+    let vertical_fov = 45.0_f32.to_radians();
+    let focal_y = 1.0 / (vertical_fov * 0.5).tan();
+    let focal_x = focal_y / aspect_ratio.max(0.1);
+
+    let context = ProjectionContext {
+        camera_position,
+        right,
+        up,
+        forward,
+        focal_x,
+        focal_y,
+        width,
+        height,
+    };
+
+    for triangle in mesh.triangle_indices() {
+        let world = [
+            as_vec3(mesh.positions()[triangle[0] as usize]),
+            as_vec3(mesh.positions()[triangle[1] as usize]),
+            as_vec3(mesh.positions()[triangle[2] as usize]),
+        ];
+        let normal = (world[1] - world[0])
+            .cross(world[2] - world[0])
+            .normalize_or_zero();
+        if normal == Vec3::ZERO {
+            continue;
+        }
+        let shade = (normal.dot(light_dir).max(0.0) * 0.65) + 0.2;
+        let color = shaded_color(shade);
+
+        let Some(projected) = project_triangle(world, context) else {
+            continue;
+        };
+        draw_projected_triangle(&mut image, &mut depth, projected, color);
+    }
+
+    image
+}
+
+fn as_vec3(position: [f64; 3]) -> Vec3 {
+    Vec3::new(position[0] as f32, position[1] as f32, position[2] as f32)
+}
+
+fn shaded_color(shade: f32) -> Rgba<u8> {
+    let base = [74.0, 124.0, 171.0];
+    let ambient = [226.0, 231.0, 236.0];
+    let mut rgba = [0u8; 4];
+    for (index, channel) in rgba.iter_mut().take(3).enumerate() {
+        let value = ambient[index] * (1.0 - shade) + base[index] * shade;
+        *channel = value.round().clamp(0.0, 255.0) as u8;
+    }
+    rgba[3] = 255;
+    Rgba(rgba)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionContext {
+    camera_position: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+    focal_x: f32,
+    focal_y: f32,
+    width: u32,
+    height: u32,
+}
+
+fn project_triangle(world: [Vec3; 3], context: ProjectionContext) -> Option<[(f32, f32, f32); 3]> {
+    let mut projected = [(0.0, 0.0, 0.0); 3];
+    for (index, vertex) in world.iter().enumerate() {
+        let relative = *vertex - context.camera_position;
+        let view_x = relative.dot(context.right);
+        let view_y = relative.dot(context.up);
+        let view_z = relative.dot(context.forward);
+        if view_z <= 0.01 {
+            return None;
+        }
+        let ndc_x = (view_x * context.focal_x) / view_z;
+        let ndc_y = (view_y * context.focal_y) / view_z;
+        let screen_x = (ndc_x + 1.0) * 0.5 * (context.width as f32 - 1.0);
+        let screen_y = (1.0 - (ndc_y + 1.0) * 0.5) * (context.height as f32 - 1.0);
+        projected[index] = (screen_x, screen_y, view_z);
+    }
+    Some(projected)
+}
+
+fn draw_projected_triangle(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    depth: &mut [f32],
+    triangle: [(f32, f32, f32); 3],
+    color: Rgba<u8>,
+) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let min_x = triangle
+        .iter()
+        .map(|vertex| vertex.0.floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, width.saturating_sub(1));
+    let max_x = triangle
+        .iter()
+        .map(|vertex| vertex.0.ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, width.saturating_sub(1));
+    let min_y = triangle
+        .iter()
+        .map(|vertex| vertex.1.floor() as i32)
+        .min()
+        .unwrap_or(0)
+        .clamp(0, height.saturating_sub(1));
+    let max_y = triangle
+        .iter()
+        .map(|vertex| vertex.1.ceil() as i32)
+        .max()
+        .unwrap_or(0)
+        .clamp(0, height.saturating_sub(1));
+
+    let area = edge_function(triangle[0], triangle[1], triangle[2].0, triangle[2].1);
+    if area.abs() <= f32::EPSILON {
+        return;
+    }
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let w0 = edge_function(triangle[1], triangle[2], sample_x, sample_y) / area;
+            let w1 = edge_function(triangle[2], triangle[0], sample_x, sample_y) / area;
+            let w2 = edge_function(triangle[0], triangle[1], sample_x, sample_y) / area;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+            let z = w0 * triangle[0].2 + w1 * triangle[1].2 + w2 * triangle[2].2;
+            let index = (y as u32 * image.width() + x as u32) as usize;
+            if z < depth[index] {
+                depth[index] = z;
+                image.put_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+}
+
+fn edge_function(a: (f32, f32, f32), b: (f32, f32, f32), x: f32, y: f32) -> f32 {
+    (x - a.0) * (b.1 - a.1) - (y - a.1) * (b.0 - a.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1955,6 +2314,33 @@ fn render_snapshot_list_text(workspace: &Workspace, snapshots: &[WorkspaceSnapsh
     output
 }
 
+fn render_preview_text(
+    workspace: &Workspace,
+    scene: &SceneDocument,
+    evaluation: &EvaluatedGeometry,
+    preview: &PreviewRenderRecord,
+) -> String {
+    let mut output = render_eval_text(workspace, scene, evaluation);
+    let _ = writeln!(&mut output);
+    let _ = writeln!(
+        &mut output,
+        "Preview path: {}",
+        preview.absolute_path.display()
+    );
+    let _ = writeln!(
+        &mut output,
+        "Preview relative path: {}",
+        preview.relative_path.display()
+    );
+    let _ = writeln!(
+        &mut output,
+        "Preview size: {}x{}",
+        preview.width, preview.height
+    );
+    let _ = write!(&mut output, "Preview bytes: {}", preview.byte_count);
+    output
+}
+
 fn workspace_json(workspace: &Workspace) -> Value {
     let summary = workspace.summary();
     json!({
@@ -2080,6 +2466,16 @@ fn snapshot_json(snapshot: &WorkspaceSnapshot) -> Value {
         "actor": actor_label(snapshot.actor()),
         "created_from_revision": snapshot.created_from_revision().get(),
         "created_at_millis": snapshot.created_at_millis(),
+    })
+}
+
+fn preview_record_json(preview: &PreviewRenderRecord) -> Value {
+    json!({
+        "relative_path": portable_path_string(&preview.relative_path),
+        "absolute_path": preview.absolute_path,
+        "width": preview.width,
+        "height": preview.height,
+        "byte_count": preview.byte_count,
     })
 }
 
@@ -2592,6 +2988,101 @@ mod tests {
         .expect("second stl export");
 
         assert_eq!(first_text, second_text);
+    }
+
+    #[test]
+    fn preview_png_writes_image_with_expected_dimensions() {
+        let workspace_root = clone_workspace_fixture();
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("preview"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--destination"),
+            OsString::from("preview/root.png"),
+            OsString::from("--width"),
+            OsString::from("640"),
+            OsString::from("--height"),
+            OsString::from("360"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Success);
+        let parsed: Value = serde_json::from_str(&result.stdout).expect("json");
+        assert_eq!(parsed["preview"]["relative_path"], "preview/root.png");
+        assert_eq!(parsed["preview"]["width"], 640);
+        assert_eq!(parsed["preview"]["height"], 360);
+
+        let bytes = fs::read(
+            workspace_root
+                .join("exports")
+                .join("preview")
+                .join("root.png"),
+        )
+        .expect("preview png");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn preview_requires_overwrite_when_destination_exists() {
+        let workspace_root = clone_workspace_fixture();
+        let preview_path = workspace_root.join("exports").join("root.png");
+        fs::write(&preview_path, b"existing preview").expect("seed preview");
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("preview"),
+            workspace_root.into_os_string(),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Io);
+        assert!(result.stderr.contains("--overwrite"));
+    }
+
+    #[test]
+    fn preview_is_deterministic_for_same_workspace_and_destination() {
+        let workspace_root = clone_workspace_fixture();
+        let first = run([
+            OsString::from("morphos"),
+            OsString::from("preview"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--destination"),
+            OsString::from("deterministic/root.png"),
+            OsString::from("--width"),
+            OsString::from("512"),
+            OsString::from("--height"),
+            OsString::from("512"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(first.exit_code, CliExitCode::Success);
+        let first_bytes = fs::read(
+            workspace_root
+                .join("exports")
+                .join("deterministic")
+                .join("root.png"),
+        )
+        .expect("first preview");
+
+        let second = run([
+            OsString::from("morphos"),
+            OsString::from("preview"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--destination"),
+            OsString::from("deterministic/root.png"),
+            OsString::from("--width"),
+            OsString::from("512"),
+            OsString::from("--height"),
+            OsString::from("512"),
+            OsString::from("--overwrite"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(second.exit_code, CliExitCode::Success);
+        let second_bytes = fs::read(
+            workspace_root
+                .join("exports")
+                .join("deterministic")
+                .join("root.png"),
+        )
+        .expect("second preview");
+
+        assert_eq!(first_bytes, second_bytes);
     }
 
     #[test]
