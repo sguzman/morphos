@@ -4,7 +4,7 @@ param(
 
     [string]$OutputSubdirectory = "batch",
 
-    [ValidateSet("obj")]
+    [ValidateSet("obj", "stl")]
     [string]$Format = "obj",
 
     [switch]$Overwrite

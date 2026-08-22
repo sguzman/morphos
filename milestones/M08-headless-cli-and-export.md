@@ -24,7 +24,7 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 ### Mesh export
 
 - [x] Add at least one practical mesh export format.
-- [ ] Add a second export format only after the first path is cleanly abstracted.
+- [x] Add a second export format only after the first path is cleanly abstracted.
 - [x] Export selected named output/subtree as well as default scene output.
 - [x] Add overwrite policy/flag.
 - [x] Include useful export statistics in CLI output.

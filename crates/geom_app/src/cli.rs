@@ -119,14 +119,16 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeshExportFormat {
     Obj,
+    Stl,
 }
 
 impl MeshExportFormat {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "obj" => Ok(Self::Obj),
+            "stl" => Ok(Self::Stl),
             _ => Err(format!(
-                "unsupported export format `{raw}`; supported formats: obj"
+                "unsupported export format `{raw}`; supported formats: obj, stl"
             )),
         }
     }
@@ -134,12 +136,14 @@ impl MeshExportFormat {
     const fn extension(self) -> &'static str {
         match self {
             Self::Obj => "obj",
+            Self::Stl => "stl",
         }
     }
 
     const fn as_str(self) -> &'static str {
         match self {
             Self::Obj => "obj",
+            Self::Stl => "stl",
         }
     }
 }
@@ -842,7 +846,7 @@ fn parse_snapshot_command(collected: &[OsString], program: &str) -> Result<Comma
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj] [--destination <relative-path>] [--overwrite] [--json]\n  {program} tx apply <workspace> --file <transaction.json> [--json]\n  {program} tx dry-run <workspace> --file <transaction.json> [--json]\n  {program} history <workspace> [--actor <actor>] [--node <node-id>] [--parameter <param-id>] [--json]\n  {program} snapshot create <workspace> --name <snapshot-name> [--json]\n  {program} snapshot list <workspace> [--json]\n  {program} snapshot restore <workspace> --id <snapshot-id> [--json]"
+        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj|stl] [--destination <relative-path>] [--overwrite] [--json]\n  {program} tx apply <workspace> --file <transaction.json> [--json]\n  {program} tx dry-run <workspace> --file <transaction.json> [--json]\n  {program} history <workspace> [--actor <actor>] [--node <node-id>] [--parameter <param-id>] [--json]\n  {program} snapshot create <workspace> --name <snapshot-name> [--json]\n  {program} snapshot list <workspace> [--json]\n  {program} snapshot restore <workspace> --id <snapshot-id> [--json]"
     )
 }
 
@@ -1660,6 +1664,7 @@ fn render_mesh_export(
 ) -> String {
     match mesh_format {
         MeshExportFormat::Obj => render_obj_export(mesh, requested_output, bounds),
+        MeshExportFormat::Stl => render_stl_export(mesh, requested_output, bounds),
     }
 }
 
@@ -1692,6 +1697,58 @@ fn render_obj_export(mesh: &Mesh, requested_output: &NodeId, bounds: &Bounds) ->
         );
     }
     output
+}
+
+fn render_stl_export(mesh: &Mesh, requested_output: &NodeId, bounds: &Bounds) -> String {
+    let mut output = String::new();
+    let _ = writeln!(&mut output, "solid {}", requested_output);
+    let _ = writeln!(&mut output, "  // Morphos STL export");
+    let _ = writeln!(&mut output, "  // bounds {}", render_bounds_text(bounds));
+    for triangle in mesh.triangle_indices() {
+        let vertices = [
+            mesh.positions()[triangle[0] as usize],
+            mesh.positions()[triangle[1] as usize],
+            mesh.positions()[triangle[2] as usize],
+        ];
+        let normal = triangle_normal(vertices[0], vertices[1], vertices[2]);
+        let _ = writeln!(
+            &mut output,
+            "  facet normal {:.9} {:.9} {:.9}",
+            normal[0], normal[1], normal[2]
+        );
+        let _ = writeln!(&mut output, "    outer loop");
+        for vertex in vertices {
+            let _ = writeln!(
+                &mut output,
+                "      vertex {:.9} {:.9} {:.9}",
+                vertex[0], vertex[1], vertex[2]
+            );
+        }
+        let _ = writeln!(&mut output, "    endloop");
+        let _ = writeln!(&mut output, "  endfacet");
+    }
+    let _ = write!(&mut output, "endsolid {}", requested_output);
+    output
+}
+
+fn triangle_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let magnitude = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    if magnitude <= f64::EPSILON {
+        [0.0, 0.0, 0.0]
+    } else {
+        [
+            cross[0] / magnitude,
+            cross[1] / magnitude,
+            cross[2] / magnitude,
+        ]
+    }
 }
 
 fn render_validate_text(workspace: &Workspace, scene: &SceneDocument) -> String {
@@ -2411,6 +2468,32 @@ mod tests {
     }
 
     #[test]
+    fn export_stl_writes_ascii_mesh_with_expected_suffix() {
+        let workspace_root = clone_workspace_fixture();
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("export"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--format"),
+            OsString::from("stl"),
+            OsString::from("--destination"),
+            OsString::from("mesh/root.stl"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Success);
+        let parsed: Value = serde_json::from_str(&result.stdout).expect("json");
+        assert_eq!(parsed["export"]["format"], "stl");
+        assert_eq!(parsed["export"]["relative_path"], "mesh/root.stl");
+
+        let text = fs::read_to_string(workspace_root.join("exports").join("mesh").join("root.stl"))
+            .expect("stl export");
+        assert!(text.starts_with("solid root\n"));
+        assert!(text.contains("\n  facet normal "));
+        assert!(text.contains("\n      vertex "));
+        assert!(text.ends_with("endsolid root"));
+    }
+
+    #[test]
     fn export_requires_overwrite_flag_when_destination_exists() {
         let workspace_root = clone_workspace_fixture();
         let export_path = workspace_root.join("exports").join("root.obj");
@@ -2462,6 +2545,51 @@ mod tests {
                 .join("root.obj"),
         )
         .expect("second export");
+
+        assert_eq!(first_text, second_text);
+    }
+
+    #[test]
+    fn export_stl_is_deterministic_for_same_workspace_and_destination() {
+        let workspace_root = clone_workspace_fixture();
+        let first = run([
+            OsString::from("morphos"),
+            OsString::from("export"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--format"),
+            OsString::from("stl"),
+            OsString::from("--destination"),
+            OsString::from("deterministic/root.stl"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(first.exit_code, CliExitCode::Success);
+        let first_text = fs::read_to_string(
+            workspace_root
+                .join("exports")
+                .join("deterministic")
+                .join("root.stl"),
+        )
+        .expect("first stl export");
+
+        let second = run([
+            OsString::from("morphos"),
+            OsString::from("export"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--format"),
+            OsString::from("stl"),
+            OsString::from("--destination"),
+            OsString::from("deterministic/root.stl"),
+            OsString::from("--overwrite"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(second.exit_code, CliExitCode::Success);
+        let second_text = fs::read_to_string(
+            workspace_root
+                .join("exports")
+                .join("deterministic")
+                .join("root.stl"),
+        )
+        .expect("second stl export");
 
         assert_eq!(first_text, second_text);
     }
