@@ -23,12 +23,12 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### Mesh export
 
-- [ ] Add at least one practical mesh export format.
+- [x] Add at least one practical mesh export format.
 - [ ] Add a second export format only after the first path is cleanly abstracted.
-- [ ] Export selected named output/subtree as well as default scene output.
-- [ ] Add overwrite policy/flag.
-- [ ] Include useful export statistics in CLI output.
-- [ ] Make deterministic export settings explicit.
+- [x] Export selected named output/subtree as well as default scene output.
+- [x] Add overwrite policy/flag.
+- [x] Include useful export statistics in CLI output.
+- [x] Make deterministic export settings explicit.
 
 ### Preview/render export
 
@@ -53,10 +53,10 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### Tests
 
-- [ ] Add CLI integration tests for validate/inspect/export.
-- [ ] Add deterministic output tests where practical.
+- [x] Add CLI integration tests for validate/inspect/export.
+- [x] Add deterministic output tests where practical.
 - [ ] Add operation dry-run/apply tests.
-- [ ] Add non-zero exit-code tests for invalid workspaces.
+- [x] Add non-zero exit-code tests for invalid workspaces.
 
 ## Completion criteria
 
