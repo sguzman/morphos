@@ -2945,6 +2945,7 @@ dependencies = [
  "geom_scene",
  "geom_workspace",
  "notify",
+ "serde_json",
 ]
 
 [[package]]

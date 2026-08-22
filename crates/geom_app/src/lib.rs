@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod cli;
 pub mod mesh_adapter;
 pub mod model;
 pub mod reactive;

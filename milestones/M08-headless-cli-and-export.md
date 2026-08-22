@@ -14,12 +14,12 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### CLI foundation
 
-- [ ] Create a `morphos` CLI binary separate from the desktop app binary.
-- [ ] Add `morphos validate <workspace>`.
-- [ ] Add `morphos inspect <workspace>` with machine-readable output option.
-- [ ] Add `morphos eval <workspace>` or equivalent build command.
-- [ ] Define stable exit codes for success, source error, geometry error, and I/O error.
-- [ ] Ensure commands do not initialize windowing/GUI systems.
+- [x] Create a `morphos` CLI binary separate from the desktop app binary.
+- [x] Add `morphos validate <workspace>`.
+- [x] Add `morphos inspect <workspace>` with machine-readable output option.
+- [x] Add `morphos eval <workspace>` or equivalent build command.
+- [x] Define stable exit codes for success, source error, geometry error, and I/O error.
+- [x] Ensure commands do not initialize windowing/GUI systems.
 
 ### Mesh export
 
@@ -46,7 +46,7 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### Batch and automation ergonomics
 
-- [ ] Support JSON output for commands intended for agent/tool consumption.
+- [x] Support JSON output for commands intended for agent/tool consumption.
 - [ ] Avoid prompts in machine mode.
 - [ ] Make stdout/stderr behavior predictable.
 - [ ] Add an example script that batch-exports multiple workspaces/variants.
