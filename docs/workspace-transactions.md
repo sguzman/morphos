@@ -1,20 +1,21 @@
-# Morphos Workspace Transactions (M07 Tranche 1)
+# Morphos Workspace Transactions (M07 Tranche 3)
 
 ## Goal
 
 M07 introduces a project-owned structured mutation boundary between GUI/automation callers and the
 canonical TOML-backed workspace state.
 
-This tranche adds:
+This milestone now adds:
 
 - typed `WorkspaceOp` scene mutations
 - atomic `WorkspaceTransaction` grouping
 - transaction actor and optional human-readable intent
 - affected-target reporting for `NodeId` and `ParamId`
 - one coherent commit record returned for each accepted transaction
+- durable per-transaction history entries in `.morphos/history`
+- typed history read errors for malformed, unsupported, or partial entries
 
-This tranche now also adds in-memory transaction-level undo/redo. It still does not add persistent
-history, snapshots, or full before/after diffs.
+It still does not add snapshots, restore flows, or full before/after diffs.
 
 ## Operation model
 
@@ -72,6 +73,10 @@ Rules in this tranche:
 - redo reapplies the original forward transaction and returns it to the undo stack
 - any new non-redo commit after an undo clears the redo stack
 - external source reloads clear both stacks because they bypass structured in-memory provenance
+
+Undo and redo themselves now also emit durable history entries because they reuse the same
+structured transaction path with fresh transaction and operation IDs plus explicit undo/redo
+intent text.
 
 ## Validation and atomicity
 
@@ -132,11 +137,49 @@ Current transaction actors are:
 - `CliAutomation`
 - `SystemMigration`
 
-Intent is an optional trimmed human-readable summary. It is returned in the commit record for UI,
-CLI, or future history consumers, but this tranche does not yet persist a durable history log.
+Intent is an optional trimmed human-readable summary. It is returned in the commit record and is
+also persisted into the durable history entry for later inspection.
 
 Undo and redo currently reissue transactions with fresh IDs and fresh operation IDs while carrying
 explicit undo/redo intent text for later provenance expansion.
+
+## Durable history
+
+Committed source-changing transactions now write one project-owned versioned history file under:
+
+`<workspace>/.morphos/history/<revision>-<transaction-id>.toml`
+
+Each entry records:
+
+- format version
+- transaction ID
+- actor
+- optional intent
+- revision before and after commit
+- affected node IDs and parameter IDs
+- per-operation IDs
+- per-operation kind strings and concise summaries
+
+Entries are sorted by revision/file name for chronological reads through
+`Workspace::history_entries()`.
+
+The history layer stays independent of egui and Bevy. It lives entirely in `geom_workspace`.
+
+## History robustness and failure policy
+
+History entries are written before the staged source save is finalized, but the live in-memory
+workspace is only swapped into place after both history and source persistence succeed.
+
+Current policy:
+
+- if history entry persistence fails, the transaction fails and canonical source is left untouched
+- if source persistence fails after a new history entry is written, Morphos removes that new
+  history entry before returning the source persistence error
+- history readers return typed errors for malformed entries, unsupported format versions, invalid
+  file naming, and leftover `.tmp` partial files
+
+This keeps canonical scene state conservative and avoids silently accepting unaudited edits, while
+remaining simple enough for deterministic tests.
 
 ## Affected targets
 
@@ -171,7 +214,6 @@ existing watcher/build separation.
 
 Still intentionally not implemented in this tranche:
 
-- persistent history log
 - snapshot creation/restoration
 - history queries
 - full structured before/after diffs

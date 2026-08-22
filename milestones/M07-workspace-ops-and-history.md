@@ -15,7 +15,7 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 ### Operation model
 
 - [x] Define project-owned `WorkspaceOp` variants for core scene mutations.
-- [ ] Include operations for add/delete/replace node.
+- [x] Include operations for add/delete/replace node.
 - [x] Include operations for rename/reparent/reference changes.
 - [x] Include operations for parameter and transform changes.
 - [ ] Include operations for workspace metadata changes where appropriate.
@@ -40,11 +40,11 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 
 ### History and snapshots
 
-- [ ] Persist a lightweight history log.
+- [x] Persist a lightweight history log.
 - [ ] Add named snapshots/checkpoints.
 - [ ] Restore a snapshot as a new transaction rather than silently replacing history.
 - [ ] Allow history queries by revision, actor, node, and time.
-- [ ] Keep history format versioned.
+- [x] Keep history format versioned.
 
 ### Diff model
 
@@ -58,19 +58,20 @@ Owns `WorkspaceOp`, transactions, inverse operations, history, snapshots, and au
 - [x] Add operation application tests.
 - [x] Add transaction atomicity tests.
 - [x] Add undo/redo round-trip tests.
-- [ ] Add actor/provenance persistence tests.
+- [x] Add actor/provenance persistence tests.
 - [ ] Add snapshot restore tests.
 - [ ] Add structured diff tests.
 
 ## Notes
 
-- The first two M07 tranches now cover the transaction foundation plus in-memory transaction-level
-  undo/redo. Persistent history, snapshots, and rich structured diffs remain later work.
-- The current operation surface matches the M06 authoring mutations. A full node-replacement
-  operation and workspace-metadata transaction operations remain future work if they become
-  necessary.
-- Undo/redo currently operates on in-memory structured transaction records and clears redo on any
-  new post-undo commit rather than branching history.
+- The first three M07 tranches now cover the transaction foundation, in-memory transaction-level
+  undo/redo, and a durable per-transaction history log with actor/intent/target provenance.
+- The current operation surface matches the M06 authoring mutations and now includes an explicit
+  full-node replacement operation. Workspace-metadata transaction operations remain future work if
+  they become necessary.
+- Undo/redo still operates on in-memory structured transaction records and clears redo on any new
+  post-undo commit rather than branching redo state, but undo/redo commits are now also captured in
+  durable history through the normal transaction path.
 
 ## Completion criteria
 

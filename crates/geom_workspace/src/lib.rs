@@ -60,6 +60,8 @@ const WORKSPACE_EXPORTS_DIR: &str = "exports";
 const WORKSPACE_CACHE_DIR: &str = "cache";
 const WORKSPACE_HISTORY_DIR: &str = "history";
 const WORKSPACE_AI_DIR: &str = "ai";
+const WORKSPACE_HISTORY_FORMAT_VERSION: u32 = 1;
+const WORKSPACE_HISTORY_FILE_EXTENSION: &str = "toml";
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_SUFFIX: &str = ".bak";
 
@@ -874,6 +876,12 @@ pub enum WorkspaceTransactionError {
         source: WorkspaceError,
     },
 
+    #[error("workspace transaction history persistence failed: {source}")]
+    History {
+        #[from]
+        source: WorkspaceHistoryError,
+    },
+
     #[error("workspace transaction cannot be inverted safely: {message}")]
     NonInvertible { message: String },
 }
@@ -971,6 +979,127 @@ pub struct Workspace {
     is_dirty: bool,
     revision: Revision,
     change_log: Vec<WorkspaceChangeSet>,
+}
+
+/// A durable history entry loaded from the reserved workspace history area.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceHistoryEntry {
+    transaction_id: TransactionId,
+    actor: TransactionActor,
+    intent: Option<String>,
+    revision_before: Revision,
+    revision_after: Revision,
+    affected_targets: AffectedTargets,
+    operations: Vec<WorkspaceHistoryOperation>,
+}
+
+impl WorkspaceHistoryEntry {
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
+    pub const fn actor(&self) -> TransactionActor {
+        self.actor
+    }
+
+    pub fn intent(&self) -> Option<&str> {
+        self.intent.as_deref()
+    }
+
+    pub const fn revision_before(&self) -> Revision {
+        self.revision_before
+    }
+
+    pub const fn revision_after(&self) -> Revision {
+        self.revision_after
+    }
+
+    pub fn affected_targets(&self) -> &AffectedTargets {
+        &self.affected_targets
+    }
+
+    pub fn operations(&self) -> &[WorkspaceHistoryOperation] {
+        &self.operations
+    }
+}
+
+/// One durable per-operation provenance record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHistoryOperation {
+    id: OperationId,
+    kind: &'static str,
+    summary: String,
+    affected_targets: AffectedTargets,
+}
+
+impl WorkspaceHistoryOperation {
+    pub fn id(&self) -> &OperationId {
+        &self.id
+    }
+
+    pub fn kind(&self) -> &str {
+        self.kind
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn affected_targets(&self) -> &AffectedTargets {
+        &self.affected_targets
+    }
+}
+
+/// Typed failures while reading or writing durable workspace history.
+#[derive(Debug, Error)]
+pub enum WorkspaceHistoryError {
+    #[error("workspace history file name is invalid at {path}: {details}")]
+    InvalidFileName { path: PathBuf, details: String },
+
+    #[error(
+        "workspace history format version {found} is unsupported at {path}; supported version is {supported}"
+    )]
+    UnsupportedFormatVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("workspace history entry is malformed at {path}: {details}")]
+    MalformedEntry { path: PathBuf, details: String },
+
+    #[error("workspace history entry is truncated or partially written at {path}")]
+    PartialEntry { path: PathBuf },
+
+    #[error("workspace history I/O failed at {path} during {operation}: {source}")]
+    Io {
+        path: PathBuf,
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceHistoryFile {
+    format_version: u32,
+    transaction_id: TransactionId,
+    actor: TransactionActor,
+    intent: Option<String>,
+    revision_before: u64,
+    revision_after: u64,
+    affected_node_ids: Vec<String>,
+    affected_parameter_ids: Vec<String>,
+    operations: Vec<WorkspaceHistoryOperationFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceHistoryOperationFile {
+    id: OperationId,
+    kind: String,
+    summary: String,
+    affected_node_ids: Vec<String>,
+    affected_parameter_ids: Vec<String>,
 }
 
 impl Workspace {
@@ -1157,9 +1286,25 @@ impl Workspace {
         )
         .expect("inverse transaction contains operations");
 
-        if self.replace_source(updated_text) {
-            self.save()?;
-        }
+        let revision_after = if updated_text != self.source_text {
+            let history = WorkspaceHistoryFile::from_transaction(
+                transaction,
+                revision_before,
+                Revision(revision_before.get() + 2),
+            );
+            let mut staged = self.clone();
+            staged.replace_source(updated_text);
+            let history_path = staged.write_history_entry(&history)?;
+            if let Err(source_error) = staged.save() {
+                let _ = remove_history_entry_file(&history_path);
+                return Err(source_error.into());
+            }
+            let revision_after = staged.revision;
+            *self = staged;
+            revision_after
+        } else {
+            self.revision
+        };
 
         Ok(WorkspaceTransactionCommit {
             transaction_id: transaction.id().clone(),
@@ -1170,8 +1315,13 @@ impl Workspace {
             forward_transaction: transaction.clone(),
             inverse_transaction,
             revision_before,
-            revision_after: self.revision,
+            revision_after,
         })
+    }
+
+    /// Loads durable transaction history entries in chronological revision order.
+    pub fn history_entries(&self) -> Result<Vec<WorkspaceHistoryEntry>, WorkspaceHistoryError> {
+        read_history_entries(self.paths.history_dir())
     }
 
     /// Returns ordered change sets recorded after the supplied revision.
@@ -1209,6 +1359,32 @@ impl Workspace {
             revision: self.revision,
             changes,
         });
+    }
+
+    fn write_history_entry(
+        &self,
+        entry: &WorkspaceHistoryFile,
+    ) -> Result<PathBuf, WorkspaceHistoryError> {
+        let history_dir = self.paths.history_dir();
+        fs::create_dir_all(&history_dir).map_err(|source| WorkspaceHistoryError::Io {
+            path: history_dir.clone(),
+            operation: "create history directory",
+            source,
+        })?;
+
+        let path = history_entry_path(
+            &history_dir,
+            Revision(entry.revision_after),
+            &entry.transaction_id,
+        );
+        let text = toml::to_string_pretty(entry).map_err(|error| {
+            WorkspaceHistoryError::MalformedEntry {
+                path: path.clone(),
+                details: error.to_string(),
+            }
+        })?;
+        write_history_file(&path, text.as_bytes())?;
+        Ok(path)
     }
 }
 
@@ -1315,6 +1491,106 @@ fn normalize_transaction_intent(intent: Option<String>) -> Option<String> {
             Some(normalized)
         }
     })
+}
+
+impl WorkspaceHistoryFile {
+    fn from_transaction(
+        transaction: &WorkspaceTransaction,
+        revision_before: Revision,
+        revision_after: Revision,
+    ) -> Self {
+        let affected_targets = transaction.affected_targets();
+        Self {
+            format_version: WORKSPACE_HISTORY_FORMAT_VERSION,
+            transaction_id: transaction.id().clone(),
+            actor: transaction.actor(),
+            intent: transaction.intent.clone(),
+            revision_before: revision_before.get(),
+            revision_after: revision_after.get(),
+            affected_node_ids: affected_targets
+                .node_ids()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            affected_parameter_ids: affected_targets
+                .parameter_ids()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            operations: transaction
+                .operations()
+                .iter()
+                .map(WorkspaceHistoryOperationFile::from_operation)
+                .collect(),
+        }
+    }
+
+    fn into_entry(self, path: &Path) -> Result<WorkspaceHistoryEntry, WorkspaceHistoryError> {
+        if self.format_version != WORKSPACE_HISTORY_FORMAT_VERSION {
+            return Err(WorkspaceHistoryError::UnsupportedFormatVersion {
+                path: path.to_path_buf(),
+                found: self.format_version,
+                supported: WORKSPACE_HISTORY_FORMAT_VERSION,
+            });
+        }
+
+        Ok(WorkspaceHistoryEntry {
+            transaction_id: self.transaction_id,
+            actor: self.actor,
+            intent: self.intent,
+            revision_before: Revision(self.revision_before),
+            revision_after: Revision(self.revision_after),
+            affected_targets: affected_targets_from_strings(
+                path,
+                &self.affected_node_ids,
+                &self.affected_parameter_ids,
+            )?,
+            operations: self
+                .operations
+                .into_iter()
+                .map(|operation| operation.into_operation(path))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl WorkspaceHistoryOperationFile {
+    fn from_operation(operation: &WorkspaceOp) -> Self {
+        Self {
+            id: operation.id().clone(),
+            kind: history_operation_kind(operation).to_owned(),
+            summary: history_operation_summary(operation),
+            affected_node_ids: operation
+                .affected_targets()
+                .node_ids()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            affected_parameter_ids: operation
+                .affected_targets()
+                .parameter_ids()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+        }
+    }
+
+    fn into_operation(
+        self,
+        path: &Path,
+    ) -> Result<WorkspaceHistoryOperation, WorkspaceHistoryError> {
+        let kind = history_kind_static(path, &self.kind)?;
+        Ok(WorkspaceHistoryOperation {
+            id: self.id,
+            kind,
+            summary: self.summary,
+            affected_targets: affected_targets_from_strings(
+                path,
+                &self.affected_node_ids,
+                &self.affected_parameter_ids,
+            )?,
+        })
+    }
 }
 
 fn undo_intent(intent: Option<&str>, transaction_id: &TransactionId) -> String {
@@ -1535,6 +1811,258 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Union(_) => "union",
         NodeKind::Difference(_) => "difference",
         NodeKind::Intersection(_) => "intersection",
+    }
+}
+
+fn read_history_entries(
+    history_dir: PathBuf,
+) -> Result<Vec<WorkspaceHistoryEntry>, WorkspaceHistoryError> {
+    if !history_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for dir_entry in fs::read_dir(&history_dir).map_err(|source| WorkspaceHistoryError::Io {
+        path: history_dir.clone(),
+        operation: "read history directory",
+        source,
+    })? {
+        let dir_entry = dir_entry.map_err(|source| WorkspaceHistoryError::Io {
+            path: history_dir.clone(),
+            operation: "iterate history directory",
+            source,
+        })?;
+        let path = dir_entry.path();
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if extension == TEMP_SUFFIX.trim_start_matches('.') {
+            return Err(WorkspaceHistoryError::PartialEntry { path });
+        }
+        if extension != WORKSPACE_HISTORY_FILE_EXTENSION {
+            continue;
+        }
+
+        let sort_key = parse_history_revision_from_path(&path)?;
+        let text = fs::read_to_string(&path).map_err(|source| WorkspaceHistoryError::Io {
+            path: path.clone(),
+            operation: "read history entry",
+            source,
+        })?;
+        let file: WorkspaceHistoryFile =
+            toml::from_str(&text).map_err(|error| WorkspaceHistoryError::MalformedEntry {
+                path: path.clone(),
+                details: error.to_string(),
+            })?;
+        entries.push((sort_key, file.into_entry(&path)?));
+    }
+
+    entries.sort_by_key(|(revision_after, entry)| {
+        (*revision_after, entry.transaction_id().to_string())
+    });
+    Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+}
+
+fn history_entry_path(
+    history_dir: &Path,
+    revision_after: Revision,
+    transaction_id: &TransactionId,
+) -> PathBuf {
+    history_dir.join(format!(
+        "{:020}-{}.{}",
+        revision_after.get(),
+        transaction_id,
+        WORKSPACE_HISTORY_FILE_EXTENSION
+    ))
+}
+
+fn parse_history_revision_from_path(path: &Path) -> Result<u64, WorkspaceHistoryError> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| WorkspaceHistoryError::InvalidFileName {
+            path: path.to_path_buf(),
+            details: "history entry file name is not valid UTF-8".to_owned(),
+        })?;
+    let Some((revision, _rest)) = file_name.split_once('-') else {
+        return Err(WorkspaceHistoryError::InvalidFileName {
+            path: path.to_path_buf(),
+            details: "expected `<revision>-<transaction>.toml`".to_owned(),
+        });
+    };
+    revision
+        .parse::<u64>()
+        .map_err(|error| WorkspaceHistoryError::InvalidFileName {
+            path: path.to_path_buf(),
+            details: format!("invalid revision prefix: {error}"),
+        })
+}
+
+fn write_history_file(path: &Path, bytes: &[u8]) -> Result<(), WorkspaceHistoryError> {
+    let parent = path.parent().ok_or_else(|| WorkspaceHistoryError::Io {
+        path: path.to_path_buf(),
+        operation: "resolve history parent directory",
+        source: io::Error::other("history file has no parent directory"),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| WorkspaceHistoryError::Io {
+        path: parent.to_path_buf(),
+        operation: "create history parent directories",
+        source,
+    })?;
+    let temp_path = temp_path_for(path);
+    fs::write(&temp_path, bytes).map_err(|source| WorkspaceHistoryError::Io {
+        path: temp_path.clone(),
+        operation: "write history temporary file",
+        source,
+    })?;
+    fs::rename(&temp_path, path).map_err(|source| WorkspaceHistoryError::Io {
+        path: path.to_path_buf(),
+        operation: "promote history temporary file",
+        source,
+    })
+}
+
+fn remove_history_entry_file(path: &Path) -> Result<(), WorkspaceHistoryError> {
+    fs::remove_file(path).map_err(|source| WorkspaceHistoryError::Io {
+        path: path.to_path_buf(),
+        operation: "remove history entry after source persistence failure",
+        source,
+    })
+}
+
+fn affected_targets_from_strings(
+    path: &Path,
+    node_ids: &[String],
+    parameter_ids: &[String],
+) -> Result<AffectedTargets, WorkspaceHistoryError> {
+    let mut targets = AffectedTargets::default();
+    for node_id in node_ids {
+        let node_id = NodeId::new(node_id.clone()).map_err(|error| {
+            WorkspaceHistoryError::MalformedEntry {
+                path: path.to_path_buf(),
+                details: format!("invalid node id `{node_id}`: {error}"),
+            }
+        })?;
+        targets.node_ids.insert(node_id);
+    }
+    for parameter_id in parameter_ids {
+        let parameter_id = ParamId::new(parameter_id.clone()).map_err(|error| {
+            WorkspaceHistoryError::MalformedEntry {
+                path: path.to_path_buf(),
+                details: format!("invalid parameter id `{parameter_id}`: {error}"),
+            }
+        })?;
+        targets.parameter_ids.insert(parameter_id);
+    }
+    Ok(targets)
+}
+
+fn history_operation_kind(operation: &WorkspaceOp) -> &'static str {
+    match operation {
+        WorkspaceOp::AddNode { .. } => "add_node",
+        WorkspaceOp::ReplaceNode { .. } => "replace_node",
+        WorkspaceOp::DeleteNode { .. } => "delete_node",
+        WorkspaceOp::RenameNode { .. } => "rename_node",
+        WorkspaceOp::DuplicateNode { .. } => "duplicate_node",
+        WorkspaceOp::SetNodeLabel { .. } => "set_node_label",
+        WorkspaceOp::SetCompositionChildren { .. } => "set_composition_children",
+        WorkspaceOp::SetParameterScalar { .. } => "set_parameter_scalar",
+        WorkspaceOp::SetTransformComponent { .. } => "set_transform_component",
+        WorkspaceOp::SetPrimitiveScalar { .. } => "set_primitive_scalar",
+        WorkspaceOp::SetRootNode { .. } => "set_root_node",
+    }
+}
+
+fn history_kind_static(path: &Path, kind: &str) -> Result<&'static str, WorkspaceHistoryError> {
+    match kind {
+        "add_node" => Ok("add_node"),
+        "replace_node" => Ok("replace_node"),
+        "delete_node" => Ok("delete_node"),
+        "rename_node" => Ok("rename_node"),
+        "duplicate_node" => Ok("duplicate_node"),
+        "set_node_label" => Ok("set_node_label"),
+        "set_composition_children" => Ok("set_composition_children"),
+        "set_parameter_scalar" => Ok("set_parameter_scalar"),
+        "set_transform_component" => Ok("set_transform_component"),
+        "set_primitive_scalar" => Ok("set_primitive_scalar"),
+        "set_root_node" => Ok("set_root_node"),
+        other => Err(WorkspaceHistoryError::MalformedEntry {
+            path: path.to_path_buf(),
+            details: format!("unknown operation kind `{other}`"),
+        }),
+    }
+}
+
+fn history_operation_summary(operation: &WorkspaceOp) -> String {
+    match operation {
+        WorkspaceOp::AddNode { node_id, draft, .. } => {
+            format!("Add node `{}` as {draft:?}", node_id.as_str())
+        }
+        WorkspaceOp::ReplaceNode { node, .. } => {
+            format!(
+                "Replace node `{}` ({})",
+                node.id().as_str(),
+                node_kind_name(node.kind())
+            )
+        }
+        WorkspaceOp::DeleteNode { node_id, .. } => format!("Delete node `{}`", node_id.as_str()),
+        WorkspaceOp::RenameNode { from, to, .. } => {
+            format!("Rename node `{}` to `{}`", from.as_str(), to.as_str())
+        }
+        WorkspaceOp::DuplicateNode {
+            source_node,
+            duplicate,
+            ..
+        } => format!(
+            "Duplicate node `{}` to `{}`",
+            source_node.as_str(),
+            duplicate.as_str()
+        ),
+        WorkspaceOp::SetNodeLabel { node_id, label, .. } => match label {
+            Some(label) => format!("Set label on `{}` to `{label}`", node_id.as_str()),
+            None => format!("Clear label on `{}`", node_id.as_str()),
+        },
+        WorkspaceOp::SetCompositionChildren {
+            node_id, children, ..
+        } => format!(
+            "Set composition children on `{}` to [{}]",
+            node_id.as_str(),
+            children
+                .iter()
+                .map(NodeId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        WorkspaceOp::SetParameterScalar {
+            parameter_id,
+            value,
+            ..
+        } => format!("Set parameter `{}` to {value}", parameter_id.as_str()),
+        WorkspaceOp::SetTransformComponent {
+            node_id,
+            property,
+            axis,
+            value,
+            ..
+        } => format!(
+            "Set transform {:?} {:?} on `{}` to {value}",
+            property,
+            axis,
+            node_id.as_str()
+        ),
+        WorkspaceOp::SetPrimitiveScalar {
+            node_id,
+            field,
+            value,
+            ..
+        } => format!(
+            "Set primitive {:?} on `{}` to {value}",
+            field,
+            node_id.as_str()
+        ),
+        WorkspaceOp::SetRootNode { node_id, .. } => {
+            format!("Set root node to `{}`", node_id.as_str())
+        }
     }
 }
 
@@ -2730,5 +3258,223 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
         history.record_commit(&commit_c);
 
         assert!(!history.availability().can_redo);
+    }
+
+    #[test]
+    fn committed_transactions_persist_durable_history_and_reload_in_order() {
+        let mut workspace = transaction_workspace();
+        let first = WorkspaceTransaction::new(
+            TransactionActor::User,
+            Some("Tune width".to_owned()),
+            vec![WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: ParamId::new("width").expect("width"),
+                value: 4.5,
+            }],
+        )
+        .expect("first transaction");
+        let first_commit = workspace.apply_transaction(&first).expect("apply first");
+
+        let second = WorkspaceTransaction::new(
+            TransactionActor::Ai,
+            Some("Retag body".to_owned()),
+            vec![WorkspaceOp::SetNodeLabel {
+                id: OperationId::new(),
+                node_id: NodeId::new("body").expect("body"),
+                label: Some("Primary".to_owned()),
+            }],
+        )
+        .expect("second transaction");
+        let second_commit = workspace.apply_transaction(&second).expect("apply second");
+
+        let history = workspace.history_entries().expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].transaction_id(), first_commit.transaction_id());
+        assert_eq!(history[0].actor(), TransactionActor::User);
+        assert_eq!(history[0].intent(), Some("Tune width"));
+        assert_eq!(history[0].revision_before(), first_commit.revision_before());
+        assert_eq!(history[0].revision_after(), first_commit.revision_after());
+        assert_eq!(history[0].operations()[0].kind(), "set_parameter_scalar");
+        assert!(
+            history[0]
+                .affected_targets()
+                .parameter_ids()
+                .contains(&ParamId::new("width").expect("width"))
+        );
+        assert_eq!(history[1].transaction_id(), second_commit.transaction_id());
+        assert_eq!(history[1].operations()[0].kind(), "set_node_label");
+
+        let reopened = Workspace::open(workspace.root()).expect("reopen");
+        let reopened_history = reopened.history_entries().expect("reopened history");
+        assert_eq!(reopened_history, history);
+    }
+
+    #[test]
+    fn undo_and_redo_add_history_entries_without_breaking_order() {
+        let mut workspace = transaction_workspace();
+        let mut undo_redo = UndoRedoManager::default();
+
+        let commit = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Rename cap".to_owned()),
+                    vec![WorkspaceOp::RenameNode {
+                        id: OperationId::new(),
+                        from: NodeId::new("cap").expect("cap"),
+                        to: NodeId::new("top").expect("top"),
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect("apply");
+        undo_redo.record_commit(&commit);
+
+        undo_redo
+            .undo(&mut workspace, TransactionActor::User)
+            .expect("undo")
+            .expect("undo commit");
+        undo_redo
+            .redo(&mut workspace, TransactionActor::User)
+            .expect("redo")
+            .expect("redo commit");
+
+        let history = workspace.history_entries().expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].intent(), Some("Rename cap"));
+        assert!(
+            history[1]
+                .intent()
+                .expect("undo intent")
+                .starts_with("Undo Rename cap")
+        );
+        assert!(
+            history[2]
+                .intent()
+                .expect("redo intent")
+                .starts_with("Redo Rename cap")
+        );
+        assert!(history[0].revision_after().get() < history[1].revision_after().get());
+        assert!(history[1].revision_after().get() < history[2].revision_after().get());
+    }
+
+    #[test]
+    fn malformed_unsupported_and_partial_history_entries_return_typed_errors() {
+        let workspace = transaction_workspace();
+        let history_dir = workspace.paths().history_dir();
+
+        fs::write(
+            history_dir.join("00000000000000000002-bad.toml"),
+            "not valid toml = [",
+        )
+        .expect("write malformed");
+        match workspace
+            .history_entries()
+            .expect_err("malformed should fail")
+        {
+            WorkspaceHistoryError::MalformedEntry { .. } => {}
+            other => panic!("unexpected malformed error: {other:?}"),
+        }
+        fs::remove_file(history_dir.join("00000000000000000002-bad.toml"))
+            .expect("cleanup malformed");
+
+        fs::write(
+            history_dir.join("00000000000000000003-unsupported.toml"),
+            r#"format_version = 99
+transaction_id = "00000000-0000-0000-0000-000000000001"
+actor = "User"
+revision_before = 0
+revision_after = 2
+affected_node_ids = []
+affected_parameter_ids = []
+operations = []
+"#,
+        )
+        .expect("write unsupported");
+        match workspace
+            .history_entries()
+            .expect_err("unsupported should fail")
+        {
+            WorkspaceHistoryError::UnsupportedFormatVersion { found, .. } => assert_eq!(found, 99),
+            other => panic!("unexpected unsupported error: {other:?}"),
+        }
+        fs::remove_file(history_dir.join("00000000000000000003-unsupported.toml"))
+            .expect("cleanup unsupported");
+
+        fs::write(
+            history_dir.join("00000000000000000004-partial.toml.tmp"),
+            "partial",
+        )
+        .expect("write partial");
+        match workspace
+            .history_entries()
+            .expect_err("partial should fail")
+        {
+            WorkspaceHistoryError::PartialEntry { .. } => {}
+            other => panic!("unexpected partial error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_write_failure_preserves_canonical_source_state() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = temp_dir.path().join("history-write-failure");
+        let mut workspace = create_workspace(
+            &workspace_root,
+            CreateWorkspaceOptions::new("History Failure"),
+        )
+        .expect("create workspace");
+        workspace.replace_source(transaction_workspace().source_text().to_owned());
+        workspace.save().expect("seed source");
+        fs::remove_dir_all(workspace.paths().history_dir()).expect("remove history dir");
+        fs::write(workspace.paths().history_dir(), "not a directory").expect("block history dir");
+
+        let original_source = workspace.source_text().to_owned();
+        let error = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Should fail before source save".to_owned()),
+                    vec![WorkspaceOp::SetNodeLabel {
+                        id: OperationId::new(),
+                        node_id: NodeId::new("body").expect("body"),
+                        label: Some("Blocked".to_owned()),
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect_err("history write should fail");
+        assert!(matches!(error, WorkspaceTransactionError::History { .. }));
+        assert_eq!(workspace.source_text(), original_source);
+        assert_eq!(
+            fs::read_to_string(workspace.paths().source_file()).expect("disk source"),
+            original_source
+        );
+    }
+
+    #[test]
+    fn source_persistence_failure_removes_new_history_entry() {
+        let mut workspace = transaction_workspace();
+        let source_path = workspace.paths().source_file();
+        install_atomic_write_failpoint(&source_path, AtomicWriteFailStage::BeforePromote);
+
+        let error = workspace
+            .apply_transaction(
+                &WorkspaceTransaction::new(
+                    TransactionActor::User,
+                    Some("Persist then fail".to_owned()),
+                    vec![WorkspaceOp::SetNodeLabel {
+                        id: OperationId::new(),
+                        node_id: NodeId::new("body").expect("body"),
+                        label: Some("Broken".to_owned()),
+                    }],
+                )
+                .expect("transaction"),
+            )
+            .expect_err("source save should fail");
+        clear_atomic_write_failpoint();
+
+        assert!(matches!(error, WorkspaceTransactionError::Workspace { .. }));
+        assert!(workspace.history_entries().expect("history").is_empty());
     }
 }
