@@ -813,6 +813,8 @@ pub fn is_relevant_watch_event(scene_path: &Path, event_paths: &[PathBuf]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geom_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticReport};
+    use geom_scene::parse_scene;
 
     const VALID_SOURCE: &str = r#"
 schema_version = 1
@@ -880,7 +882,10 @@ size = { x = 1.0, y = 2.0, z = 3.0 }
             requested_at: now,
             kind: BuildOutcomeKind::Failure {
                 stage: DiagnosticStage::Scene,
-                message: "stale".to_owned(),
+                report: DiagnosticReport::new(vec![Diagnostic::error(
+                    DiagnosticCode::invalid_value(),
+                    "stale",
+                )]),
                 timings: ReactiveBuildTimings::zero(),
             },
         };
@@ -898,7 +903,10 @@ size = { x = 1.0, y = 2.0, z = 3.0 }
             requested_at: newest.requested_at,
             kind: BuildOutcomeKind::Failure {
                 stage: DiagnosticStage::Scene,
-                message: "current".to_owned(),
+                report: DiagnosticReport::new(vec![Diagnostic::error(
+                    DiagnosticCode::invalid_value(),
+                    "current",
+                )]),
                 timings: ReactiveBuildTimings::zero(),
             },
         };
