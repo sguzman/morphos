@@ -2941,6 +2941,7 @@ dependencies = [
  "bevy_egui",
  "blake3",
  "crossbeam-channel",
+ "geom_diagnostics",
  "geom_geometry",
  "geom_scene",
  "geom_workspace",
@@ -2951,11 +2952,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "geom_diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "geom_geometry"
 version = "0.1.0"
 dependencies = [
  "boolmesh",
  "criterion",
+ "geom_diagnostics",
  "geom_scene",
  "glam 0.30.10",
  "indexmap",
@@ -2965,6 +2975,7 @@ dependencies = [
 name = "geom_scene"
 version = "0.1.0"
 dependencies = [
+ "geom_diagnostics",
  "geom_workspace",
  "indexmap",
  "tempfile",

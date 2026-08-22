@@ -480,7 +480,54 @@ fn ui_system(
                     .fill(egui::Color32::from_rgba_unmultiplied(18, 20, 26, 220))
                     .show(ui, |ui| {
                         ui.label(message);
+                        if status.displaying_last_good_geometry {
+                            ui.separator();
+                            ui.label(
+                                "Showing last successful geometry while the current source revision has diagnostics.",
+                            );
+                        }
                     });
+            });
+    }
+
+    if !status.diagnostics.is_empty() {
+        egui::Window::new("Diagnostics")
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
+            .default_width(420.0)
+            .default_height(220.0)
+            .show(context, |ui| {
+                if status.displaying_last_good_geometry {
+                    ui.label("Current source failed; viewport is still showing the last successful geometry.");
+                    ui.separator();
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for diagnostic in &status.diagnostics {
+                        ui.group(|ui| {
+                            ui.label(format!(
+                                "{:?} {}",
+                                diagnostic.severity, diagnostic.code.0
+                            ));
+                            ui.label(&diagnostic.message);
+                            if let Some(node_id) = &diagnostic.node_id {
+                                ui.label(format!("Node: {node_id}"));
+                            }
+                            if let Some(parameter_id) = &diagnostic.parameter_id {
+                                ui.label(format!("Parameter: {parameter_id}"));
+                            }
+                            if let Some(source) = &diagnostic.source
+                                && let (Some(line), Some(column)) = (source.line, source.column)
+                            {
+                                ui.label(format!("Source: line {line}, column {column}"));
+                            }
+                            for note in &diagnostic.notes {
+                                ui.label(format!("Note: {note}"));
+                            }
+                            if let Some(remediation) = &diagnostic.remediation {
+                                ui.label(format!("Remediation: {remediation}"));
+                            }
+                        });
+                    }
+                });
             });
     }
 

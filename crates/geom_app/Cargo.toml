@@ -10,6 +10,7 @@ bevy = "0.19.1"
 bevy_egui = "0.41.1"
 blake3 = "1.8.2"
 crossbeam-channel = "0.5.15"
+geom_diagnostics = { path = "../geom_diagnostics" }
 geom_geometry = { path = "../geom_geometry" }
 geom_scene = { path = "../geom_scene" }
 geom_workspace = { path = "../geom_workspace" }

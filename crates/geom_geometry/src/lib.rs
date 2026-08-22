@@ -13,6 +13,7 @@
 //! - third-party backend types remain internal to the backend implementation
 //! - cache entries reuse unchanged subtrees and invalidate only dependents
 
+use geom_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticReport};
 use geom_scene::{
     CompositionNode, NodeId, NodeKind, ParamId, ParameterDefinition, ScalarExpr, SceneDocument,
     Transform, Vector3Expr,
@@ -915,6 +916,144 @@ impl fmt::Display for GeometryErrorKind {
             }
         }
     }
+}
+
+pub fn diagnostic_from_geometry_error(error: &GeometryError) -> Diagnostic {
+    let mut diagnostic = match error.kind() {
+        GeometryErrorKind::UnknownOutput { requested } => Diagnostic::error(
+            DiagnosticCode::unknown_output(),
+            format!("unknown output node `{requested}`"),
+        )
+        .with_node_id(requested.as_str()),
+        GeometryErrorKind::UnknownParameter { parameter } => Diagnostic::error(
+            DiagnosticCode::unknown_parameter(),
+            format!("unknown parameter `{parameter}`"),
+        )
+        .with_parameter_id(parameter.as_str()),
+        GeometryErrorKind::InvalidParameterValue { parameter, reason } => {
+            let code = if *reason == "value must be finite" {
+                DiagnosticCode::nonfinite_value()
+            } else {
+                DiagnosticCode::invalid_value()
+            };
+            Diagnostic::error(code, format!("invalid parameter `{parameter}`: {reason}"))
+                .with_parameter_id(parameter.as_str())
+        }
+        GeometryErrorKind::InvalidTransform { reason } => {
+            let code = if *reason == "scale must be positive" {
+                DiagnosticCode::invalid_scale()
+            } else if reason.contains("finite") {
+                DiagnosticCode::nonfinite_value()
+            } else {
+                DiagnosticCode::invalid_value()
+            };
+            Diagnostic::error(code, format!("invalid transform: {reason}"))
+        }
+        GeometryErrorKind::InvalidPrimitive { reason } => {
+            let code = if reason.contains("finite") {
+                DiagnosticCode::nonfinite_value()
+            } else {
+                DiagnosticCode::invalid_primitive()
+            };
+            Diagnostic::error(code, format!("invalid primitive: {reason}"))
+        }
+        GeometryErrorKind::InvalidComposition {
+            operator,
+            child_count,
+        } => Diagnostic::error(
+            DiagnosticCode::invalid_composition(),
+            format!(
+                "invalid `{operator}` composition: expected at least 2 children, found {child_count}"
+            ),
+        )
+        .with_context("operator", *operator)
+        .with_context("child_count", child_count.to_string()),
+        GeometryErrorKind::DependencyCycle { cycle } => Diagnostic::error(
+            DiagnosticCode::dependency_cycle(),
+            format!(
+                "dependency cycle detected: {}",
+                cycle
+                    .iter()
+                    .map(NodeId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
+        )
+        .with_note("Geometry evaluation could not produce an acyclic dependency order."),
+        GeometryErrorKind::UnsupportedShape { shape } => Diagnostic::error(
+            DiagnosticCode::unsupported_geometry(),
+            format!("unsupported shape `{shape}`"),
+        )
+        .with_remediation("Choose a backend-supported primitive or switch to a supported export path."),
+        GeometryErrorKind::InvalidMesh { reason } => {
+            let code = if *reason == "mesh is empty" {
+                DiagnosticCode::empty_geometry()
+            } else {
+                DiagnosticCode::invalid_mesh()
+            };
+            Diagnostic::error(code, format!("invalid mesh: {reason}"))
+        }
+        GeometryErrorKind::BackendFailure { stage, message } => Diagnostic::error(
+            DiagnosticCode::geometry_backend(),
+            format!("geometry backend failed during {stage}: {message}"),
+        )
+        .with_context("backend_stage", stage.to_string()),
+    };
+
+    if let Some(node) = error.source_node() {
+        diagnostic = diagnostic.with_node_id(node.as_str());
+    }
+
+    diagnostic
+}
+
+pub fn validate_evaluated_geometry(geometry: &EvaluatedGeometry) -> DiagnosticReport {
+    let mut diagnostics = Vec::new();
+
+    if geometry.mesh.is_empty() {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::empty_geometry(),
+                format!("geometry evaluation for `{}` produced an empty mesh", geometry.requested_output),
+            )
+            .with_node_id(geometry.requested_output.as_str()),
+        );
+    }
+
+    for position in geometry.mesh.positions() {
+        for coordinate in position {
+            if !coordinate.is_finite() {
+                diagnostics.push(
+                    Diagnostic::error(
+                        DiagnosticCode::invalid_mesh(),
+                        format!(
+                            "geometry evaluation for `{}` produced a non-finite mesh position",
+                            geometry.requested_output
+                        ),
+                    )
+                    .with_node_id(geometry.requested_output.as_str()),
+                );
+                break;
+            }
+        }
+    }
+
+    if let Some(size) = geometry.bounds.size() {
+        if size.iter().any(|value| !value.is_finite()) {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::invalid_mesh(),
+                    format!(
+                        "geometry evaluation for `{}` produced non-finite bounds",
+                        geometry.requested_output
+                    ),
+                )
+                .with_node_id(geometry.requested_output.as_str()),
+            );
+        }
+    }
+
+    DiagnosticReport::new(diagnostics)
 }
 
 /// Backend operation stage for normalized errors.

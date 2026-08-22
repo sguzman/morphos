@@ -1,8 +1,13 @@
 use crate::model::DisplayedGeometry;
 use crate::viewport::DisplayGeometryRevision;
 use blake3::Hasher;
-use geom_geometry::{BoolmeshBackend, GeometryEvaluator};
-use geom_scene::{NodeId, ParamId, SceneDocument, parse_scene};
+use geom_diagnostics::{DiagnosticReport, DiagnosticTiming};
+use geom_geometry::{
+    BoolmeshBackend, GeometryEvaluator, diagnostic_from_geometry_error, validate_evaluated_geometry,
+};
+use geom_scene::{
+    NodeId, ParamId, SceneDocument, parse_scene_report,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -201,7 +206,7 @@ pub struct ReactiveDiagnostic {
     pub stage: DiagnosticStage,
     pub source_revision: SourceRevision,
     pub generation: BuildGeneration,
-    pub message: String,
+    pub report: DiagnosticReport,
 }
 
 /// A worker-side success payload.
@@ -221,7 +226,7 @@ pub enum BuildOutcomeKind {
     Success(Box<ReactiveBuildSuccess>),
     Failure {
         stage: DiagnosticStage,
-        message: String,
+        report: DiagnosticReport,
         timings: ReactiveBuildTimings,
     },
 }
@@ -543,10 +548,25 @@ impl BuildWorker {
     pub fn process(&mut self, request: BuildRequestSnapshot) -> BuildOutcome {
         let total_started = request.requested_at;
         let parse_started = Instant::now();
-        let scene = match parse_scene(&request.source_text) {
+        let scene = match parse_scene_report(&request.source_text) {
             Ok(scene) => scene,
-            Err(error) => {
+            Err(mut report) => {
                 let now = Instant::now();
+                attach_timings(
+                    &mut report,
+                    ReactiveBuildTimings {
+                        parse_millis: now
+                            .saturating_duration_since(parse_started)
+                            .as_secs_f64()
+                            * 1_000.0,
+                        evaluation_millis: 0.0,
+                        mesh_upload_millis: 0.0,
+                        total_millis: now
+                            .saturating_duration_since(total_started)
+                            .as_secs_f64()
+                            * 1_000.0,
+                    },
+                );
                 return BuildOutcome {
                     session_id: request.session_id,
                     generation: request.generation,
@@ -556,7 +576,7 @@ impl BuildWorker {
                     requested_at: request.requested_at,
                     kind: BuildOutcomeKind::Failure {
                         stage: DiagnosticStage::Scene,
-                        message: error.to_string(),
+                        report,
                         timings: ReactiveBuildTimings {
                             parse_millis: now
                                 .saturating_duration_since(parse_started)
@@ -625,6 +645,36 @@ impl BuildWorker {
                     .saturating_duration_since(total_started)
                     .as_secs_f64()
                     * 1_000.0;
+                let mut report = validate_evaluated_geometry(&geometry);
+                if report.has_blocking() {
+                    attach_timings(
+                        &mut report,
+                        ReactiveBuildTimings {
+                            parse_millis,
+                            evaluation_millis,
+                            mesh_upload_millis: 0.0,
+                            total_millis,
+                        },
+                    );
+                    return BuildOutcome {
+                        session_id: request.session_id,
+                        generation: request.generation,
+                        source_revision: request.source_revision,
+                        source_fingerprint: request.source_fingerprint,
+                        origin: request.origin,
+                        requested_at: request.requested_at,
+                        kind: BuildOutcomeKind::Failure {
+                            stage: DiagnosticStage::Geometry,
+                            report,
+                            timings: ReactiveBuildTimings {
+                                parse_millis,
+                                evaluation_millis,
+                                mesh_upload_millis: 0.0,
+                                total_millis,
+                            },
+                        },
+                    };
+                }
                 self.last_successful_scene = Some(scene.clone());
                 BuildOutcome {
                     session_id: request.session_id,
@@ -650,6 +700,23 @@ impl BuildWorker {
             }
             Err(error) => {
                 let now = Instant::now();
+                let mut report =
+                    DiagnosticReport::new(vec![diagnostic_from_geometry_error(&error)]);
+                attach_timings(
+                    &mut report,
+                    ReactiveBuildTimings {
+                        parse_millis,
+                        evaluation_millis: now
+                            .saturating_duration_since(evaluation_started)
+                            .as_secs_f64()
+                            * 1_000.0,
+                        mesh_upload_millis: 0.0,
+                        total_millis: now
+                            .saturating_duration_since(total_started)
+                            .as_secs_f64()
+                            * 1_000.0,
+                    },
+                );
                 BuildOutcome {
                     session_id: request.session_id,
                     generation: request.generation,
@@ -659,7 +726,7 @@ impl BuildWorker {
                     requested_at: request.requested_at,
                     kind: BuildOutcomeKind::Failure {
                         stage: DiagnosticStage::Geometry,
-                        message: error.to_string(),
+                        report,
                         timings: ReactiveBuildTimings {
                             parse_millis,
                             evaluation_millis: now
@@ -682,6 +749,17 @@ impl BuildWorker {
 impl Default for BuildWorker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn attach_timings(report: &mut DiagnosticReport, timings: ReactiveBuildTimings) {
+    for diagnostic in &mut report.diagnostics {
+        diagnostic.telemetry = Some(DiagnosticTiming {
+            parse_millis: Some(timings.parse_millis.round() as u64),
+            validation_millis: None,
+            evaluation_millis: Some(timings.evaluation_millis.round() as u64),
+            total_millis: Some(timings.total_millis.round() as u64),
+        });
     }
 }
 

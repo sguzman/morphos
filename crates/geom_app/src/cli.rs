@@ -1,7 +1,11 @@
 use crate::camera::{CameraFrame, OrbitCameraState};
 use bevy::prelude::{EulerRot, Quat, Vec3};
+use geom_diagnostics::{Diagnostic, DiagnosticReport};
 use geom_geometry::{BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh};
-use geom_scene::{Node, NodeId, ParamId, SceneDocument, parse_scene};
+use geom_geometry::{diagnostic_from_geometry_error, validate_evaluated_geometry};
+use geom_scene::{
+    Node, NodeId, ParamId, SceneDocument, parse_scene, parse_scene_report,
+};
 use geom_workspace::{
     HistoryQuery, OperationId, SnapshotId, TransactionActor, Workspace, WorkspaceDirectory,
     WorkspaceHistoryEntry, WorkspaceOp, WorkspaceSceneChange, WorkspaceSceneDiff,
@@ -171,7 +175,7 @@ where
 
     match execute_command(parsed) {
         Ok(stdout) => CliRunResult::success(stdout),
-        Err(error) => CliRunResult::failure(error.exit_code, error.message),
+        Err(error) => CliRunResult::failure(error.exit_code, error.rendered_message()),
     }
 }
 
@@ -179,6 +183,8 @@ where
 struct CliError {
     exit_code: CliExitCode,
     message: String,
+    diagnostics: Option<DiagnosticReport>,
+    output_format: OutputFormat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -331,6 +337,35 @@ impl CliError {
         Self {
             exit_code,
             message: message.into(),
+            diagnostics: None,
+            output_format: OutputFormat::Text,
+        }
+    }
+
+    fn with_diagnostics(
+        exit_code: CliExitCode,
+        message: impl Into<String>,
+        diagnostics: DiagnosticReport,
+        output_format: OutputFormat,
+    ) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+            diagnostics: Some(diagnostics),
+            output_format,
+        }
+    }
+
+    fn rendered_message(&self) -> String {
+        match (&self.diagnostics, self.output_format) {
+            (Some(report), OutputFormat::Json) => serde_json::to_string_pretty(&json!({
+                "status": "error",
+                "message": self.message,
+                "diagnostics": report.diagnostics.iter().map(diagnostic_json).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_else(|_| self.message.clone()),
+            (Some(report), OutputFormat::Text) => render_diagnostic_text(report),
+            (None, _) => self.message.clone(),
         }
     }
 }
@@ -907,7 +942,7 @@ fn execute_command(command: Command) -> Result<String, CliError> {
     match command {
         Command::Validate { workspace, format } => {
             let workspace = open_workspace(&workspace)?;
-            let scene = parse_workspace_scene(&workspace)?;
+            let scene = parse_workspace_scene(&workspace, format)?;
             render_output(
                 format,
                 render_validate_text(&workspace, &scene),
@@ -921,7 +956,7 @@ fn execute_command(command: Command) -> Result<String, CliError> {
         }
         Command::Inspect { workspace, format } => {
             let workspace = open_workspace(&workspace)?;
-            let scene = parse_workspace_scene(&workspace)?;
+            let scene = parse_workspace_scene(&workspace, format)?;
             render_output(
                 format,
                 render_inspect_text(&workspace, &scene),
@@ -939,8 +974,8 @@ fn execute_command(command: Command) -> Result<String, CliError> {
             format,
         } => {
             let workspace = open_workspace(&workspace)?;
-            let scene = parse_workspace_scene(&workspace)?;
-            let evaluation = evaluate_scene(&scene, output.as_ref())?;
+            let scene = parse_workspace_scene(&workspace, format)?;
+            let evaluation = evaluate_scene(&scene, output.as_ref(), format)?;
             render_output(
                 format,
                 render_eval_text(&workspace, &scene, &evaluation),
@@ -962,8 +997,8 @@ fn execute_command(command: Command) -> Result<String, CliError> {
             format,
         } => {
             let workspace = open_workspace(&workspace)?;
-            let scene = parse_workspace_scene(&workspace)?;
-            let evaluation = evaluate_scene(&scene, output.as_ref())?;
+            let scene = parse_workspace_scene(&workspace, format)?;
+            let evaluation = evaluate_scene(&scene, output.as_ref(), format)?;
             let export = export_mesh(
                 &workspace,
                 &evaluation,
@@ -994,8 +1029,8 @@ fn execute_command(command: Command) -> Result<String, CliError> {
             format,
         } => {
             let workspace = open_workspace(&workspace)?;
-            let scene = parse_workspace_scene(&workspace)?;
-            let evaluation = evaluate_scene(&scene, output.as_ref())?;
+            let scene = parse_workspace_scene(&workspace, format)?;
+            let evaluation = evaluate_scene(&scene, output.as_ref(), format)?;
             let preview = render_preview_image(
                 &workspace,
                 &evaluation,
@@ -1872,14 +1907,16 @@ fn open_workspace(path: &Path) -> Result<Workspace, CliError> {
     })
 }
 
-fn parse_workspace_scene(workspace: &Workspace) -> Result<SceneDocument, CliError> {
-    parse_scene(workspace.source_text()).map_err(|error| {
-        CliError::new(
+fn parse_workspace_scene(
+    workspace: &Workspace,
+    format: OutputFormat,
+) -> Result<SceneDocument, CliError> {
+    parse_scene_report(workspace.source_text()).map_err(|report| {
+        CliError::with_diagnostics(
             CliExitCode::Source,
-            format!(
-                "scene validation failed for `{}`: {error}",
-                workspace.root().display()
-            ),
+            format!("scene validation failed for `{}`", workspace.root().display()),
+            report,
+            format,
         )
     })
 }
@@ -1887,18 +1924,31 @@ fn parse_workspace_scene(workspace: &Workspace) -> Result<SceneDocument, CliErro
 fn evaluate_scene(
     scene: &SceneDocument,
     output: Option<&NodeId>,
+    format: OutputFormat,
 ) -> Result<EvaluatedGeometry, CliError> {
     let mut evaluator = GeometryEvaluator::new(BoolmeshBackend::new());
-    match output {
+    let evaluation = match output {
         Some(node) => evaluator.evaluate_node(scene, node),
         None => evaluator.evaluate_root(scene),
-    }
-    .map_err(|error| {
-        CliError::new(
+    };
+    let evaluation = evaluation.map_err(|error| {
+        CliError::with_diagnostics(
             CliExitCode::Geometry,
-            format!("geometry evaluation failed: {error}"),
+            "geometry evaluation failed",
+            DiagnosticReport::new(vec![diagnostic_from_geometry_error(&error)]),
+            format,
         )
-    })
+    })?;
+    let report = validate_evaluated_geometry(&evaluation);
+    if report.has_blocking() {
+        return Err(CliError::with_diagnostics(
+            CliExitCode::Geometry,
+            "geometry evaluation failed",
+            report,
+            format,
+        ));
+    }
+    Ok(evaluation)
 }
 
 fn render_output(format: OutputFormat, text: String, value: Value) -> Result<String, CliError> {
@@ -1911,6 +1961,45 @@ fn render_output(format: OutputFormat, text: String, value: Value) -> Result<Str
             )
         }),
     }
+}
+
+fn render_diagnostic_text(report: &DiagnosticReport) -> String {
+    let mut output = String::new();
+    for (index, diagnostic) in report.diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            &mut output,
+            "{:?} {} {}",
+            diagnostic.severity, diagnostic.code.0, diagnostic.message
+        );
+        if let Some(source) = &diagnostic.source {
+            if let Some(path) = &source.path {
+                let _ = writeln!(&mut output, "  at {}", path);
+            }
+            if let (Some(line), Some(column)) = (source.line, source.column) {
+                let _ = writeln!(&mut output, "  line {}, column {}", line, column);
+            }
+        }
+        if let Some(node_id) = &diagnostic.node_id {
+            let _ = writeln!(&mut output, "  node {}", node_id);
+        }
+        if let Some(parameter_id) = &diagnostic.parameter_id {
+            let _ = writeln!(&mut output, "  parameter {}", parameter_id);
+        }
+        for note in &diagnostic.notes {
+            let _ = writeln!(&mut output, "  note {}", note);
+        }
+        if let Some(remediation) = &diagnostic.remediation {
+            let _ = writeln!(&mut output, "  remediation {}", remediation);
+        }
+    }
+    output.trim_end().to_owned()
+}
+
+fn diagnostic_json(diagnostic: &Diagnostic) -> Value {
+    json!(diagnostic)
 }
 
 fn export_mesh(

@@ -26,6 +26,9 @@
 //! - unknown structural fields are rejected, while designated `extensions`
 //!   sections are preserved as opaque-but-typed metadata
 
+use geom_diagnostics::{
+    Diagnostic, DiagnosticCode, DiagnosticReport, DiagnosticSourceLocation, DiagnosticSourceSpan,
+};
 use indexmap::IndexMap;
 use std::error::Error;
 use std::fmt;
@@ -40,6 +43,23 @@ pub fn parse_scene(source: &str) -> Result<SceneDocument, SceneError> {
     let scene_source = SceneSource::parse(source)?;
     let scene_source = migrate_to_current(scene_source)?;
     scene_source.validate()
+}
+
+/// Parses and validates source into a semantic document or a structured diagnostic report.
+pub fn parse_scene_report(source: &str) -> Result<SceneDocument, DiagnosticReport> {
+    match parse_scene(source) {
+        Ok(scene) => {
+            let report = validate_scene_document(&scene);
+            if report.has_blocking() {
+                Err(report)
+            } else {
+                Ok(scene)
+            }
+        }
+        Err(error) => Err(DiagnosticReport::new(vec![diagnostic_from_scene_error(
+            &error, None,
+        )])),
+    }
 }
 
 /// Serializes a semantic scene document into canonical TOML.
@@ -1149,6 +1169,464 @@ impl fmt::Display for SceneErrorKind {
             Self::CycleDetected { node } => {
                 write!(f, "cycle detected while resolving node `{node}`")
             }
+        }
+    }
+}
+
+pub fn validate_scene_document(scene: &SceneDocument) -> DiagnosticReport {
+    let mut diagnostics = Vec::new();
+    let passes: [fn(&SceneDocument, &mut Vec<Diagnostic>); 6] = [
+        validate_root_pass,
+        validate_parameter_values_pass,
+        validate_node_references_pass,
+        validate_transforms_pass,
+        validate_primitives_pass,
+        validate_cycles_pass,
+    ];
+
+    for pass in passes {
+        pass(scene, &mut diagnostics);
+    }
+
+    diagnostics.sort_by(|left, right| {
+        left.code
+            .cmp(&right.code)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.parameter_id.cmp(&right.parameter_id))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    DiagnosticReport::new(diagnostics)
+}
+
+pub fn diagnostic_from_scene_error(error: &SceneError, source_path: Option<&str>) -> Diagnostic {
+    let mut diagnostic = match error.kind() {
+        SceneErrorKind::Parse { message } => Diagnostic::error(
+            DiagnosticCode::source_parse(),
+            format!("failed to parse scene TOML: {message}"),
+        )
+        .with_remediation("Fix the TOML syntax so the scene can be parsed."),
+        SceneErrorKind::UnsupportedSchemaVersion { found, supported } => Diagnostic::error(
+            DiagnosticCode::unsupported_schema_version(),
+            format!(
+                "unsupported scene schema version {found}; current supported version is {supported}"
+            ),
+        ),
+        SceneErrorKind::MissingField { field, context } => Diagnostic::error(
+            DiagnosticCode::missing_field(),
+            match context {
+                Some(context) => format!("missing required field `{field}` in `{context}`"),
+                None => format!("missing required field `{field}`"),
+            },
+        ),
+        SceneErrorKind::UnknownField { path } => {
+            Diagnostic::error(DiagnosticCode::unknown_field(), format!("unknown field `{path}`"))
+        }
+        SceneErrorKind::InvalidIdentifier { kind, value } => Diagnostic::error(
+            DiagnosticCode::invalid_id(),
+            format!("invalid {kind} identifier `{value}`"),
+        ),
+        SceneErrorKind::MissingRootNode { root } => Diagnostic::error(
+            DiagnosticCode::invalid_root(),
+            format!("root node `{root}` does not exist"),
+        )
+        .with_node_id(root.as_str())
+        .with_remediation("Set `root` to an existing node identifier."),
+        SceneErrorKind::MissingNode { node } => Diagnostic::error(
+            DiagnosticCode::broken_node_reference(),
+            format!("node `{node}` does not exist"),
+        )
+        .with_node_id(node.as_str()),
+        SceneErrorKind::MissingParameter { parameter } => Diagnostic::error(
+            DiagnosticCode::broken_parameter_reference(),
+            format!("parameter `{parameter}` does not exist"),
+        )
+        .with_parameter_id(parameter.as_str()),
+        SceneErrorKind::InvalidNodeReference { owner, target } => Diagnostic::error(
+            DiagnosticCode::broken_node_reference(),
+            format!("node `{owner}` references missing node `{target}`"),
+        )
+        .with_node_id(owner.as_str())
+        .with_context("target", target),
+        SceneErrorKind::InvalidParameterReference { context, target } => Diagnostic::error(
+            DiagnosticCode::broken_parameter_reference(),
+            format!("{context} references missing parameter `{target}`"),
+        )
+        .with_parameter_id(target.as_str()),
+        SceneErrorKind::InvalidValue { context, message } => {
+            let code = if message.contains("finite") {
+                DiagnosticCode::nonfinite_value()
+            } else if context.contains("scale") || message.contains("positive") {
+                DiagnosticCode::invalid_scale()
+            } else {
+                DiagnosticCode::invalid_value()
+            };
+            Diagnostic::error(code, format!("invalid {context}: {message}"))
+        }
+        SceneErrorKind::InvalidEditTarget { message } => {
+            Diagnostic::error(DiagnosticCode::invalid_value(), message.clone())
+        }
+        SceneErrorKind::CycleDetected { node } => Diagnostic::error(
+            DiagnosticCode::dependency_cycle(),
+            format!("cycle detected while resolving node `{node}`"),
+        )
+        .with_node_id(node.as_str()),
+    };
+
+    if let Some(span) = error.span() {
+        diagnostic = diagnostic.with_source(DiagnosticSourceLocation {
+            path: source_path.map(ToOwned::to_owned),
+            span: Some(DiagnosticSourceSpan {
+                start: span.start,
+                end: span.end,
+                start_line: span.start_line,
+                start_column: span.start_column,
+                end_line: span.end_line,
+                end_column: span.end_column,
+            }),
+            byte_offset: Some(span.start),
+            line: Some(span.start_line),
+            column: Some(span.start_column),
+        });
+    }
+
+    diagnostic
+}
+
+fn validate_root_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    if !scene.nodes().contains_key(scene.root()) {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::invalid_root(),
+                format!("root node `{}` does not exist", scene.root()),
+            )
+            .with_node_id(scene.root().as_str())
+            .with_remediation("Set the scene root to an existing node."),
+        );
+    }
+}
+
+fn validate_parameter_values_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    for parameter in scene.parameters().values() {
+        let value = parameter.scalar_value();
+        if !value.is_finite() {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::nonfinite_value(),
+                    format!("parameter `{}` must be finite", parameter.id()),
+                )
+                .with_parameter_id(parameter.id().as_str()),
+            );
+        }
+    }
+}
+
+fn validate_node_references_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    for node in scene.nodes().values() {
+        validate_scalar_expr_refs(
+            &node.transform().translation.x,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.translate.x",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().translation.y,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.translate.y",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().translation.z,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.translate.z",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().rotation_deg.x,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.rotate_deg.x",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().rotation_deg.y,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.rotate_deg.y",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().rotation_deg.z,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.rotate_deg.z",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().scale.x,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.scale.x",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().scale.y,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.scale.y",
+        );
+        validate_scalar_expr_refs(
+            &node.transform().scale.z,
+            scene,
+            diagnostics,
+            node.id(),
+            "transform.scale.z",
+        );
+
+        match node.kind() {
+            NodeKind::Box(primitive) => {
+                validate_vector3_refs(&primitive.size, scene, diagnostics, node.id(), "size");
+            }
+            NodeKind::Sphere(primitive) => {
+                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
+            }
+            NodeKind::Cylinder(primitive) => {
+                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Capsule(primitive) => {
+                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Plane(primitive) => {
+                validate_scalar_expr_refs(&primitive.width, scene, diagnostics, node.id(), "width");
+                validate_scalar_expr_refs(&primitive.depth, scene, diagnostics, node.id(), "depth");
+            }
+            NodeKind::Profile(primitive) => {
+                validate_scalar_expr_refs(&primitive.width, scene, diagnostics, node.id(), "width");
+                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Union(composition)
+            | NodeKind::Difference(composition)
+            | NodeKind::Intersection(composition) => {
+                if composition.children.len() < 2 {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagnosticCode::invalid_composition(),
+                            format!(
+                                "node `{}` composition requires at least two child references",
+                                node.id()
+                            ),
+                        )
+                        .with_node_id(node.id().as_str()),
+                    );
+                }
+                for child in &composition.children {
+                    if !scene.nodes().contains_key(child.target()) {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                DiagnosticCode::broken_node_reference(),
+                                format!(
+                                    "node `{}` references missing node `{}`",
+                                    node.id(),
+                                    child.target()
+                                ),
+                            )
+                            .with_node_id(node.id().as_str())
+                            .with_context("target", child.target().as_str()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_transforms_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    for node in scene.nodes().values() {
+        for (axis, expr) in [
+            ("x", &node.transform().scale.x),
+            ("y", &node.transform().scale.y),
+            ("z", &node.transform().scale.z),
+        ] {
+            if let Some(value) = literal_or_parameter_value(expr, scene)
+                && (!value.is_finite() || value <= 0.0)
+            {
+                diagnostics.push(
+                    Diagnostic::error(
+                        DiagnosticCode::invalid_scale(),
+                        format!("node `{}` has invalid scale.{axis}", node.id()),
+                    )
+                    .with_node_id(node.id().as_str())
+                    .with_note("Scale values must be finite and strictly positive."),
+                );
+            }
+        }
+    }
+}
+
+fn validate_primitives_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    for node in scene.nodes().values() {
+        match node.kind() {
+            NodeKind::Box(primitive) => {
+                validate_positive_vector3(&primitive.size, scene, diagnostics, node.id(), "size");
+            }
+            NodeKind::Sphere(primitive) => {
+                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
+            }
+            NodeKind::Cylinder(primitive) => {
+                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Capsule(primitive) => {
+                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Plane(primitive) => {
+                validate_positive_scalar(&primitive.width, scene, diagnostics, node.id(), "width");
+                validate_positive_scalar(&primitive.depth, scene, diagnostics, node.id(), "depth");
+            }
+            NodeKind::Profile(primitive) => {
+                validate_positive_scalar(&primitive.width, scene, diagnostics, node.id(), "width");
+                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+            }
+            NodeKind::Union(_) | NodeKind::Difference(_) | NodeKind::Intersection(_) => {}
+        }
+    }
+}
+
+fn validate_cycles_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnostic>) {
+    let mut state = IndexMap::new();
+    let mut stack = Vec::new();
+    for node_id in scene.nodes().keys() {
+        detect_scene_cycle(node_id, scene, &mut state, &mut stack, diagnostics);
+    }
+}
+
+fn detect_scene_cycle(
+    node_id: &NodeId,
+    scene: &SceneDocument,
+    state: &mut IndexMap<NodeId, VisitState>,
+    stack: &mut Vec<NodeId>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match state.get(node_id) {
+        Some(VisitState::Visiting) => {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::dependency_cycle(),
+                    format!("cycle detected while resolving node `{node_id}`"),
+                )
+                .with_node_id(node_id.as_str()),
+            );
+            return;
+        }
+        Some(VisitState::Visited) => return,
+        _ => {}
+    }
+
+    state.insert(node_id.clone(), VisitState::Visiting);
+    stack.push(node_id.clone());
+    if let Some(node) = scene.nodes().get(node_id) {
+        match node.kind() {
+            NodeKind::Union(composition)
+            | NodeKind::Difference(composition)
+            | NodeKind::Intersection(composition) => {
+                for child in &composition.children {
+                    detect_scene_cycle(child.target(), scene, state, stack, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.pop();
+    state.insert(node_id.clone(), VisitState::Visited);
+}
+
+fn validate_vector3_refs(
+    vector: &Vector3Expr,
+    scene: &SceneDocument,
+    diagnostics: &mut Vec<Diagnostic>,
+    node_id: &NodeId,
+    context: &str,
+) {
+    validate_scalar_expr_refs(&vector.x, scene, diagnostics, node_id, &format!("{context}.x"));
+    validate_scalar_expr_refs(&vector.y, scene, diagnostics, node_id, &format!("{context}.y"));
+    validate_scalar_expr_refs(&vector.z, scene, diagnostics, node_id, &format!("{context}.z"));
+}
+
+fn validate_scalar_expr_refs(
+    expr: &ScalarExpr,
+    scene: &SceneDocument,
+    diagnostics: &mut Vec<Diagnostic>,
+    node_id: &NodeId,
+    context: &str,
+) {
+    if let ScalarExpr::Parameter(parameter) = expr
+        && !scene.parameters().contains_key(parameter.target())
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::broken_parameter_reference(),
+                format!(
+                    "node `{}` references missing parameter `{}` in {}",
+                    node_id,
+                    parameter.target(),
+                    context
+                ),
+            )
+            .with_node_id(node_id.as_str())
+            .with_parameter_id(parameter.target().as_str()),
+        );
+    }
+}
+
+fn literal_or_parameter_value(expr: &ScalarExpr, scene: &SceneDocument) -> Option<f64> {
+    match expr {
+        ScalarExpr::Literal(value) => Some(*value),
+        ScalarExpr::Parameter(parameter) => scene.parameters().get(parameter.target()).map(|entry| entry.scalar_value()),
+    }
+}
+
+fn validate_positive_vector3(
+    vector: &Vector3Expr,
+    scene: &SceneDocument,
+    diagnostics: &mut Vec<Diagnostic>,
+    node_id: &NodeId,
+    context: &str,
+) {
+    for (axis, expr) in [("x", &vector.x), ("y", &vector.y), ("z", &vector.z)] {
+        validate_positive_scalar(expr, scene, diagnostics, node_id, &format!("{context}.{axis}"));
+    }
+}
+
+fn validate_positive_scalar(
+    expr: &ScalarExpr,
+    scene: &SceneDocument,
+    diagnostics: &mut Vec<Diagnostic>,
+    node_id: &NodeId,
+    context: &str,
+) {
+    if let Some(value) = literal_or_parameter_value(expr, scene) {
+        if !value.is_finite() {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::nonfinite_value(),
+                    format!("node `{}` has non-finite {context}", node_id),
+                )
+                .with_node_id(node_id.as_str()),
+            );
+        } else if value <= 0.0 {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::invalid_primitive(),
+                    format!("node `{}` must use a positive {context}", node_id),
+                )
+                .with_node_id(node_id.as_str()),
+            );
         }
     }
 }

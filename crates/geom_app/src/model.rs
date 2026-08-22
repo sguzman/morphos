@@ -6,6 +6,7 @@ use crate::reactive::{
 use crate::scene_tree::SceneTreeModel;
 use crate::viewport::DisplayGeometryRevision;
 use bevy::prelude::Resource;
+use geom_diagnostics::{Diagnostic, DiagnosticReport};
 use geom_geometry::{BoolmeshBackend, Bounds, GeometryEvaluator};
 use geom_scene::{
     Axis, NodeId, ParamId, PrimitiveScalarField, SceneDocument, SceneNodeDraft, SourceLocation,
@@ -494,12 +495,12 @@ impl AppModel {
                 ),
                 BuildOutcomeKind::Failure {
                     stage,
-                    message,
+                    report,
                     timings,
                 } => {
                     self.accept_failure(
                         stage,
-                        message,
+                        report,
                         outcome.source_revision,
                         outcome.generation,
                         timings,
@@ -532,31 +533,36 @@ impl AppModel {
             .map(|geometry| geometry.requested_output.to_string());
         let selection_label = selection.selected_node.as_ref().map(ToString::to_string);
 
-        let (build_kind, build_label, error_message) = match &self.build_status {
+        let (build_kind, build_label, error_message, diagnostics) = match &self.build_status {
             AppBuildStatus::NoWorkspace => (
                 BuildStatusKind::NoWorkspace,
                 "No workspace".to_owned(),
                 None,
+                Vec::new(),
             ),
             AppBuildStatus::WorkspaceError(message) => (
                 BuildStatusKind::WorkspaceError,
                 "Workspace error".to_owned(),
                 Some(message.clone()),
+                Vec::new(),
             ),
             AppBuildStatus::Conflict(message) => (
                 BuildStatusKind::Conflict,
                 "Edit conflict".to_owned(),
                 Some(message.clone()),
+                Vec::new(),
             ),
             AppBuildStatus::SceneError(diagnostic) => (
                 BuildStatusKind::SceneError,
                 "Scene error".to_owned(),
-                Some(diagnostic.message.clone()),
+                diagnostic.report.primary_message().map(ToOwned::to_owned),
+                diagnostic.report.diagnostics.clone(),
             ),
             AppBuildStatus::GeometryError(diagnostic) => (
                 BuildStatusKind::GeometryError,
                 "Geometry error".to_owned(),
-                Some(diagnostic.message.clone()),
+                diagnostic.report.primary_message().map(ToOwned::to_owned),
+                diagnostic.report.diagnostics.clone(),
             ),
             AppBuildStatus::Success(success) => {
                 let kind = if success.displayed_geometry_revision == DisplayGeometryRevision::ZERO {
@@ -564,7 +570,7 @@ impl AppModel {
                 } else {
                     BuildStatusKind::Success
                 };
-                (kind, "Success".to_owned(), None)
+                (kind, "Success".to_owned(), None, Vec::new())
             }
         };
 
@@ -591,6 +597,11 @@ impl AppModel {
             build_kind,
             build_label,
             error_message,
+            diagnostics,
+            displaying_last_good_geometry: matches!(
+                self.build_status,
+                AppBuildStatus::SceneError(_) | AppBuildStatus::GeometryError(_)
+            ) && self.displayed_geometry.is_some(),
             timings: reactive.timings,
             current_output,
             selection: selection_label,
@@ -648,7 +659,7 @@ impl AppModel {
     fn accept_failure(
         &mut self,
         stage: DiagnosticStage,
-        message: String,
+        report: DiagnosticReport,
         source_revision: SourceRevision,
         generation: BuildGeneration,
         _timings: ReactiveBuildTimings,
@@ -657,13 +668,25 @@ impl AppModel {
             stage,
             source_revision,
             generation,
-            message,
+            report,
         });
         self.build_status = match stage {
             DiagnosticStage::Workspace => {
-                AppBuildStatus::WorkspaceError(diagnostic.message.clone())
+                AppBuildStatus::WorkspaceError(
+                    diagnostic
+                        .report
+                        .primary_message()
+                        .unwrap_or("workspace error")
+                        .to_owned(),
+                )
             }
-            DiagnosticStage::Conflict => AppBuildStatus::Conflict(diagnostic.message.clone()),
+            DiagnosticStage::Conflict => AppBuildStatus::Conflict(
+                diagnostic
+                    .report
+                    .primary_message()
+                    .unwrap_or("edit conflict")
+                    .to_owned(),
+            ),
             DiagnosticStage::Scene => AppBuildStatus::SceneError(diagnostic),
             DiagnosticStage::Geometry => AppBuildStatus::GeometryError(diagnostic),
         };
@@ -897,6 +920,8 @@ pub struct UiStatusSnapshot {
     pub build_kind: BuildStatusKind,
     pub build_label: String,
     pub error_message: Option<String>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub displaying_last_good_geometry: bool,
     pub timings: Option<ReactiveBuildTimings>,
     pub current_output: Option<String>,
     pub selection: Option<String>,

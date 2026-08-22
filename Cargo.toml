@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/geom_app",
+    "crates/geom_diagnostics",
     "crates/geom_geometry",
     "crates/geom_scene",
     "crates/geom_workspace",

@@ -9,6 +9,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+geom_diagnostics = { path = "../geom_diagnostics" }
 indexmap = "2.12"
 thiserror = "2.0"
 toml_edit = "0.22"
