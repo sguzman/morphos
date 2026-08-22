@@ -119,6 +119,12 @@ enum AppCommand {
     SetRootNode(NodeId),
     AddNode(NodeId, SceneNodeDraft),
     SetCompositionChildren(NodeId, Vec<NodeId>),
+    AcceptAiProposal(String, String),
+    RejectAiProposal(String, String),
+    AcceptAllAiProposals(String),
+    RejectAllAiProposals(String),
+    CancelAiEditSession(String),
+    RevertAiEditSession(String),
 }
 
 #[derive(Debug, Default, Resource)]
@@ -460,6 +466,14 @@ fn ui_system(
             render_inspector_panel(ui, &app_model, &viewport, &mut editor_state, &mut commands);
         });
 
+    egui::Window::new("AI Edit Sessions")
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -12.0))
+        .default_width(420.0)
+        .default_height(260.0)
+        .show(context, |ui| {
+            render_ai_edit_sessions_panel(ui, &app_model, &mut commands);
+        });
+
     let overlay_message = match status.build_kind {
         BuildStatusKind::NoWorkspace => {
             Some("No workspace opened. Launch Morphos with a workspace path.")
@@ -574,6 +588,117 @@ fn synchronize_editor_buffers(
         editor_state.rename_buffer.clear();
         editor_state.duplicate_buffer.clear();
     }
+}
+
+fn render_ai_edit_sessions_panel(
+    ui: &mut egui::Ui,
+    app_model: &AppModel,
+    commands: &mut MessageWriter<AppCommand>,
+) {
+    let sessions = app_model.ai_edit_sessions();
+    if sessions.is_empty() {
+        ui.label("No persisted AI edit sessions found for the current workspace.");
+        ui.label(
+            "M11 review UI can inspect sessions created through the public API or stdio transport.",
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for session in sessions {
+            ui.group(|ui| {
+                ui.heading(format!("Session {}", session.session_id));
+                ui.label(format!("Intent: {}", session.user_intent));
+                ui.label(format!("Policy: {:?}", session.policy));
+                ui.label(format!("Status: {:?}", session.status));
+                ui.label(format!("Base Revision: {}", session.base_revision));
+                if let Some(restore_point) = &session.restore_point {
+                    ui.label(format!(
+                        "Restore Point: {} @ revision {}",
+                        restore_point.snapshot_id, restore_point.created_from_revision
+                    ));
+                }
+                if let Some(outcome) = &session.final_outcome {
+                    ui.label(format!("Outcome: {:?} ({})", outcome.kind, outcome.message));
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Accept All").clicked() {
+                        commands.write(AppCommand::AcceptAllAiProposals(
+                            session.session_id.to_string(),
+                        ));
+                    }
+                    if ui.button("Reject All").clicked() {
+                        commands.write(AppCommand::RejectAllAiProposals(
+                            session.session_id.to_string(),
+                        ));
+                    }
+                    if ui.button("Cancel Session").clicked() {
+                        commands.write(AppCommand::CancelAiEditSession(
+                            session.session_id.to_string(),
+                        ));
+                    }
+                    if ui.button("Revert Session").clicked() {
+                        commands.write(AppCommand::RevertAiEditSession(
+                            session.session_id.to_string(),
+                        ));
+                    }
+                });
+
+                for proposal in &session.proposals {
+                    ui.separator();
+                    ui.label(format!(
+                        "Proposal {} [{:?}]",
+                        proposal.proposal_id, proposal.state
+                    ));
+                    if let Some(rationale) = &proposal.rationale {
+                        ui.label(format!("Rationale: {rationale}"));
+                    }
+                    if let Some(diff) = &proposal.diff {
+                        ui.label(format!("Diff: {}", diff.summary));
+                        for change in diff.changes.iter().take(4) {
+                            ui.label(format!(" - {change}"));
+                        }
+                    }
+                    if !proposal.affected_node_ids.is_empty() {
+                        ui.label(format!(
+                            "Affected Nodes: {}",
+                            proposal.affected_node_ids.join(", ")
+                        ));
+                    }
+                    if !proposal.affected_parameter_ids.is_empty() {
+                        ui.label(format!(
+                            "Affected Params: {}",
+                            proposal.affected_parameter_ids.join(", ")
+                        ));
+                    }
+                    if !proposal.diagnostics.is_empty() {
+                        ui.label(format!("Diagnostics: {}", proposal.diagnostics.len()));
+                    }
+                    if matches!(
+                        proposal.state,
+                        geom_workspace_api::AiProposalState::Proposed
+                            | geom_workspace_api::AiProposalState::Stale
+                    ) {
+                        ui.horizontal(|ui| {
+                            if ui.button("Accept").clicked() {
+                                commands.write(AppCommand::AcceptAiProposal(
+                                    session.session_id.to_string(),
+                                    proposal.proposal_id.to_string(),
+                                ));
+                            }
+                            if ui.button("Reject").clicked() {
+                                commands.write(AppCommand::RejectAiProposal(
+                                    session.session_id.to_string(),
+                                    proposal.proposal_id.to_string(),
+                                ));
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn render_scene_tree_panel(
@@ -1575,6 +1700,42 @@ fn process_app_commands_system(
                 Ok(None) => {}
                 Err(error) => warn!("composition edit failed: {error:?}"),
             },
+            AppCommand::AcceptAiProposal(session_id, proposal_id) => {
+                match app_model.accept_ai_proposal(session_id, proposal_id, Instant::now()) {
+                    Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                    Ok(None) => {}
+                    Err(error) => warn!("accept ai proposal failed: {error:?}"),
+                }
+            }
+            AppCommand::RejectAiProposal(session_id, proposal_id) => {
+                if let Err(error) = app_model.reject_ai_proposal(session_id, proposal_id) {
+                    warn!("reject ai proposal failed: {error:?}");
+                }
+            }
+            AppCommand::AcceptAllAiProposals(session_id) => {
+                match app_model.accept_all_ai_proposals(session_id, Instant::now()) {
+                    Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                    Ok(None) => {}
+                    Err(error) => warn!("accept all ai proposals failed: {error:?}"),
+                }
+            }
+            AppCommand::RejectAllAiProposals(session_id) => {
+                if let Err(error) = app_model.reject_all_ai_proposals(session_id) {
+                    warn!("reject all ai proposals failed: {error:?}");
+                }
+            }
+            AppCommand::CancelAiEditSession(session_id) => {
+                if let Err(error) = app_model.cancel_ai_edit_session(session_id) {
+                    warn!("cancel ai session failed: {error:?}");
+                }
+            }
+            AppCommand::RevertAiEditSession(session_id) => {
+                match app_model.revert_ai_edit_session(session_id, Instant::now()) {
+                    Ok(Some(request)) => dispatch_build_request(&mut runtime, request),
+                    Ok(None) => {}
+                    Err(error) => warn!("revert ai session failed: {error:?}"),
+                }
+            }
         }
     }
 }

@@ -1,6 +1,8 @@
 use crate::{
     CollectionBounds, DiagnosticFilter, EvaluateOutputRequest, NodeQuery, PreviewRequest,
-    RecentHistoryQuery, SourceSnippetRequest, TransactionProposal, WorkspaceApi, WorkspaceApiError,
+    RecentHistoryQuery, SessionEventQuery, SessionProposalQuery, SessionQuery,
+    SourceSnippetRequest, StartAiEditSessionRequest, SubmitAiProposalRequest, TransactionProposal,
+    WorkspaceApi, WorkspaceApiError,
 };
 use geom_workspace::Workspace;
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,12 @@ struct BoundsRequest {
 struct DiagnosticsRequest {
     #[serde(default)]
     filter: DiagnosticFilter,
+    #[serde(default)]
+    bounds: CollectionBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct SessionListRequest {
     #[serde(default)]
     bounds: CollectionBounds,
 }
@@ -153,6 +161,71 @@ impl ProtocolServer {
                 let params: SourceSnippetRequest = parse_params(request.params.clone())?;
                 serialize_result(&WorkspaceApi::source_snippet(workspace, params)?)
             }),
+            "start_edit_session" => self.with_workspace(&request, |workspace| {
+                let params: StartAiEditSessionRequest = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::start_ai_edit_session(workspace, params)?)
+            }),
+            "get_edit_session" => self.with_workspace(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::get_ai_edit_session(workspace, params)?)
+            }),
+            "list_edit_sessions" => self.with_workspace(&request, |workspace| {
+                let params: SessionListRequest = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::list_ai_edit_sessions(
+                    workspace,
+                    params.bounds,
+                )?)
+            }),
+            "submit_proposal" => self.with_workspace_mut(&request, |workspace| {
+                let params: SessionSubmitProposalRequest = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::submit_ai_proposal(
+                    workspace,
+                    &params.session_id,
+                    params.request,
+                )?)
+            }),
+            "accept_proposal" => self.with_workspace_mut(&request, |workspace| {
+                let params: SessionProposalQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::accept_ai_proposal(workspace, params)?)
+            }),
+            "reject_proposal" => self.with_workspace(&request, |workspace| {
+                let params: SessionProposalQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::reject_ai_proposal(workspace, params)?)
+            }),
+            "accept_all" => self.with_workspace_mut(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::accept_all_ai_proposals(workspace, params)?)
+            }),
+            "reject_all" => self.with_workspace(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::reject_all_ai_proposals(workspace, params)?)
+            }),
+            "submit_live_step" => self.with_workspace_mut(&request, |workspace| {
+                let params: SessionSubmitProposalRequest = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::submit_live_ai_step(
+                    workspace,
+                    &params.session_id,
+                    params.request,
+                )?)
+            }),
+            "cancel_edit_session" => self.with_workspace(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::cancel_ai_edit_session(workspace, params)?)
+            }),
+            "complete_edit_session" => self.with_workspace(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::complete_ai_edit_session(workspace, params)?)
+            }),
+            "revert_edit_session" => self.with_workspace_mut(&request, |workspace| {
+                let params: SessionQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::revert_ai_edit_session(workspace, params)?)
+            }),
+            "get_edit_session_events" => self.with_workspace(&request, |workspace| {
+                let params: SessionEventQuery = parse_params(request.params.clone())?;
+                serialize_result(&WorkspaceApi::get_ai_edit_session_events(
+                    workspace, params,
+                )?)
+            }),
             "dry_run_transaction" => self.with_workspace(&request, |workspace| {
                 let params: TransactionProposal = parse_params(request.params.clone())?;
                 serialize_result(&WorkspaceApi::dry_run_transaction(workspace, params)?)
@@ -179,6 +252,12 @@ impl ProtocolServer {
             ),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SessionSubmitProposalRequest {
+    session_id: String,
+    request: SubmitAiProposalRequest,
 }
 
 fn parse_params<T>(value: Value) -> Result<T, ApiProtocolError>
@@ -275,12 +354,32 @@ fn protocol_error_from_workspace(error: impl Into<WorkspaceApiError>) -> ApiProt
             message,
             data: None,
         },
+        WorkspaceApiError::ApprovalRequired { message } => ApiProtocolError {
+            code: "approval_required".to_owned(),
+            message,
+            data: None,
+        },
         WorkspaceApiError::StaleRevision { expected, current } => ApiProtocolError {
             code: "stale_revision".to_owned(),
             message: format!("expected revision {expected}, current revision {current}"),
             data: Some(json!({
                 "expected_revision": expected,
                 "current_revision": current,
+            })),
+        },
+        WorkspaceApiError::InvalidSessionState { message } => ApiProtocolError {
+            code: "invalid_session_state".to_owned(),
+            message,
+            data: None,
+        },
+        WorkspaceApiError::RevertConflict {
+            message,
+            conflicting_transaction_ids,
+        } => ApiProtocolError {
+            code: "revert_conflict".to_owned(),
+            message,
+            data: Some(json!({
+                "conflicting_transaction_ids": conflicting_transaction_ids,
             })),
         },
         WorkspaceApiError::Validation {

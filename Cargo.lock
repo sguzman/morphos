@@ -2945,6 +2945,7 @@ dependencies = [
  "geom_geometry",
  "geom_scene",
  "geom_workspace",
+ "geom_workspace_api",
  "image",
  "notify",
  "serde",
@@ -3007,6 +3008,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

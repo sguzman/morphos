@@ -16,6 +16,9 @@ use geom_workspace::{
     OperationId, Revision, TransactionActor, UndoRedoAvailability, UndoRedoManager, Workspace,
     WorkspaceError, WorkspaceOp, WorkspaceSummary, WorkspaceTransaction, WorkspaceTransactionError,
 };
+use geom_workspace_api::{
+    AiEditSession, CollectionBounds, SessionProposalQuery, SessionQuery, WorkspaceApi,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -520,6 +523,112 @@ impl AppModel {
         }
     }
 
+    pub fn ai_edit_sessions(&self) -> Vec<AiEditSession> {
+        let Some(workspace) = self.workspace.as_ref() else {
+            return Vec::new();
+        };
+        WorkspaceApi::list_ai_edit_sessions(workspace, CollectionBounds::new(64))
+            .map(|result| result.value.items)
+            .unwrap_or_default()
+    }
+
+    pub fn accept_ai_proposal(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_ai_session_mutation(now, |workspace| {
+            WorkspaceApi::accept_ai_proposal(
+                workspace,
+                SessionProposalQuery {
+                    session_id: session_id.to_owned(),
+                    proposal_id: proposal_id.to_owned(),
+                },
+            )
+        })
+    }
+
+    pub fn reject_ai_proposal(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+    ) -> Result<(), AppEditError> {
+        let Some(workspace) = self.workspace.as_ref() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+        WorkspaceApi::reject_ai_proposal(
+            workspace,
+            SessionProposalQuery {
+                session_id: session_id.to_owned(),
+                proposal_id: proposal_id.to_owned(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| AppEditError::Conflict(error.to_string()))
+    }
+
+    pub fn accept_all_ai_proposals(
+        &mut self,
+        session_id: &str,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_ai_session_mutation(now, |workspace| {
+            WorkspaceApi::accept_all_ai_proposals(
+                workspace,
+                SessionQuery {
+                    session_id: session_id.to_owned(),
+                },
+            )
+        })
+    }
+
+    pub fn reject_all_ai_proposals(&mut self, session_id: &str) -> Result<(), AppEditError> {
+        let Some(workspace) = self.workspace.as_ref() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+        WorkspaceApi::reject_all_ai_proposals(
+            workspace,
+            SessionQuery {
+                session_id: session_id.to_owned(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| AppEditError::Conflict(error.to_string()))
+    }
+
+    pub fn cancel_ai_edit_session(&mut self, session_id: &str) -> Result<(), AppEditError> {
+        let Some(workspace) = self.workspace.as_ref() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+        WorkspaceApi::cancel_ai_edit_session(
+            workspace,
+            SessionQuery {
+                session_id: session_id.to_owned(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| AppEditError::Conflict(error.to_string()))
+    }
+
+    pub fn revert_ai_edit_session(
+        &mut self,
+        session_id: &str,
+        now: Instant,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError> {
+        self.apply_ai_session_mutation(now, |workspace| {
+            WorkspaceApi::revert_ai_edit_session(
+                workspace,
+                SessionQuery {
+                    session_id: session_id.to_owned(),
+                },
+            )
+        })
+    }
+
     pub fn ui_status_snapshot(
         &self,
         geometry_revision: DisplayGeometryRevision,
@@ -747,6 +856,61 @@ impl AppModel {
         Ok(Some(self.reactive.accept_internal_source_write(
             workspace.source_text(),
             origin,
+            now,
+        )))
+    }
+
+    fn apply_ai_session_mutation<F>(
+        &mut self,
+        now: Instant,
+        mutation: F,
+    ) -> Result<Option<BuildRequestSnapshot>, AppEditError>
+    where
+        F: FnOnce(
+            &mut Workspace,
+        ) -> Result<
+            geom_workspace_api::WorkspaceReadContext<AiEditSession>,
+            geom_workspace_api::WorkspaceApiError,
+        >,
+    {
+        if let Some(reason) = self.editing_disabled_reason() {
+            return Err(AppEditError::Conflict(reason.to_owned()));
+        }
+
+        let base_fingerprint = self
+            .reactive
+            .current_source_fingerprint()
+            .ok_or_else(|| AppEditError::Conflict("no current source fingerprint".to_owned()))?;
+        let Some(workspace) = self.workspace.as_mut() else {
+            self.build_status = AppBuildStatus::NoWorkspace;
+            return Err(AppEditError::Conflict("no workspace is open".to_owned()));
+        };
+
+        let disk_source =
+            fs::read_to_string(workspace.paths().source_file()).map_err(|source| {
+                AppEditError::Workspace(WorkspaceError::Io {
+                    path: workspace.paths().source_file(),
+                    operation: "read current source for conflict check",
+                    source,
+                })
+            })?;
+        if SourceFingerprint::from_text(&disk_source) != base_fingerprint {
+            let message =
+                "external source changed since the GUI edit base; retry against the newest source"
+                    .to_owned();
+            self.build_status = AppBuildStatus::Conflict(message.clone());
+            return Err(AppEditError::Conflict(message));
+        }
+
+        let revision_before = workspace.revision();
+        mutation(workspace).map_err(|error| AppEditError::Conflict(error.to_string()))?;
+        if workspace.revision() == revision_before {
+            return Ok(None);
+        }
+
+        Ok(Some(self.reactive.accept_internal_source_write(
+            workspace.source_text(),
+            EditOrigin::Gui,
             now,
         )))
     }

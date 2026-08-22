@@ -61,7 +61,7 @@ const WORKSPACE_EXPORTS_DIR: &str = "exports";
 const WORKSPACE_CACHE_DIR: &str = "cache";
 const WORKSPACE_HISTORY_DIR: &str = "history";
 const WORKSPACE_AI_DIR: &str = "ai";
-const WORKSPACE_HISTORY_FORMAT_VERSION: u32 = 1;
+const WORKSPACE_HISTORY_FORMAT_VERSION: u32 = 2;
 const WORKSPACE_HISTORY_FILE_EXTENSION: &str = "toml";
 const WORKSPACE_SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const WORKSPACE_SNAPSHOT_FILE_EXTENSION: &str = "snapshot.toml";
@@ -494,6 +494,13 @@ pub enum TransactionActor {
     SystemMigration,
 }
 
+/// Optional structured provenance attached to one workspace transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransactionCorrelation {
+    pub ai_session_id: Option<String>,
+    pub ai_proposal_id: Option<String>,
+}
+
 /// A typed semantic workspace operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceOp {
@@ -753,6 +760,7 @@ pub struct WorkspaceTransaction {
     id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    correlation: Option<TransactionCorrelation>,
     operations: Vec<WorkspaceOp>,
 }
 
@@ -763,6 +771,16 @@ impl WorkspaceTransaction {
         intent: Option<String>,
         operations: Vec<WorkspaceOp>,
     ) -> Result<Self, WorkspaceTransactionError> {
+        Self::new_with_correlation(actor, intent, None, operations)
+    }
+
+    /// Creates a new transaction with optional structured provenance metadata.
+    pub fn new_with_correlation(
+        actor: TransactionActor,
+        intent: Option<String>,
+        correlation: Option<TransactionCorrelation>,
+        operations: Vec<WorkspaceOp>,
+    ) -> Result<Self, WorkspaceTransactionError> {
         if operations.is_empty() {
             return Err(WorkspaceTransactionError::EmptyTransaction);
         }
@@ -770,6 +788,7 @@ impl WorkspaceTransaction {
             id: TransactionId::new(),
             actor,
             intent: normalize_transaction_intent(intent),
+            correlation,
             operations,
         })
     }
@@ -787,6 +806,11 @@ impl WorkspaceTransaction {
     /// Returns the optional human-readable intent/summary.
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
+    }
+
+    /// Returns optional structured provenance metadata.
+    pub fn correlation(&self) -> Option<&TransactionCorrelation> {
+        self.correlation.as_ref()
     }
 
     /// Returns the ordered operations in this transaction.
@@ -808,6 +832,7 @@ impl WorkspaceTransaction {
             id: TransactionId::new(),
             actor,
             intent: normalize_transaction_intent(intent),
+            correlation: None,
             operations: self
                 .operations
                 .iter()
@@ -848,6 +873,7 @@ pub struct WorkspaceTransactionCommit {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    correlation: Option<TransactionCorrelation>,
     operation_ids: Vec<OperationId>,
     affected_targets: AffectedTargets,
     forward_transaction: WorkspaceTransaction,
@@ -870,6 +896,11 @@ impl WorkspaceTransactionCommit {
     /// Returns the optional human-readable transaction intent.
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
+    }
+
+    /// Returns optional structured provenance metadata.
+    pub fn correlation(&self) -> Option<&TransactionCorrelation> {
+        self.correlation.as_ref()
     }
 
     /// Returns the stable operation IDs committed by this transaction.
@@ -1038,6 +1069,7 @@ pub struct WorkspaceHistoryEntry {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    correlation: Option<TransactionCorrelation>,
     timestamp_millis: u64,
     revision_before: Revision,
     revision_after: Revision,
@@ -1058,6 +1090,10 @@ impl WorkspaceHistoryEntry {
 
     pub fn intent(&self) -> Option<&str> {
         self.intent.as_deref()
+    }
+
+    pub fn correlation(&self) -> Option<&TransactionCorrelation> {
+        self.correlation.as_ref()
     }
 
     pub const fn timestamp_millis(&self) -> u64 {
@@ -1408,6 +1444,7 @@ struct WorkspaceHistoryFile {
     transaction_id: TransactionId,
     actor: TransactionActor,
     intent: Option<String>,
+    correlation: Option<TransactionCorrelation>,
     timestamp_millis: u64,
     revision_before: u64,
     revision_after: u64,
@@ -1652,6 +1689,7 @@ impl Workspace {
             transaction_id: transaction.id().clone(),
             actor: transaction.actor(),
             intent: transaction.intent.clone(),
+            correlation: transaction.correlation().cloned(),
             operation_ids,
             affected_targets,
             forward_transaction: transaction.clone(),
@@ -2045,6 +2083,7 @@ impl WorkspaceHistoryFile {
             transaction_id: transaction.id().clone(),
             actor: transaction.actor(),
             intent: transaction.intent.clone(),
+            correlation: transaction.correlation().cloned(),
             timestamp_millis: current_time_millis(),
             revision_before: revision_before.get(),
             revision_after: revision_after.get(),
@@ -2081,6 +2120,7 @@ impl WorkspaceHistoryFile {
             transaction_id: self.transaction_id,
             actor: self.actor,
             intent: self.intent,
+            correlation: self.correlation,
             timestamp_millis: self.timestamp_millis,
             revision_before: Revision(self.revision_before),
             revision_after: Revision(self.revision_after),

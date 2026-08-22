@@ -3,7 +3,9 @@
 //! The API is intentionally provider-independent and operates only through
 //! project-owned workspace, scene, geometry, and diagnostics crates.
 
+mod edit_sessions;
 pub mod protocol;
+pub use edit_sessions::*;
 
 use geom_diagnostics::Diagnostic;
 use geom_geometry::{
@@ -403,8 +405,20 @@ pub enum WorkspaceApiError {
     #[error("workspace API request is invalid: {message}")]
     InvalidRequest { message: String },
 
+    #[error("workspace API request cannot proceed without explicit approval: {message}")]
+    ApprovalRequired { message: String },
+
     #[error("workspace API revision mismatch: expected {expected}, current {current}")]
     StaleRevision { expected: u64, current: u64 },
+
+    #[error("workspace API session state is invalid: {message}")]
+    InvalidSessionState { message: String },
+
+    #[error("workspace API revert conflict: {message}")]
+    RevertConflict {
+        message: String,
+        conflicting_transaction_ids: Vec<String>,
+    },
 
     #[error("workspace API validation failed: {message}")]
     Validation {
@@ -456,7 +470,12 @@ impl WorkspaceApi {
             snapshots_available: true,
             dry_run_available: true,
             source_snippet_available: true,
-            optional_features: vec!["stdio_transport".to_owned()],
+            optional_features: vec![
+                "stdio_transport".to_owned(),
+                "ai_edit_sessions".to_owned(),
+                "ai_edit_session_events".to_owned(),
+                "ai_edit_session_revert".to_owned(),
+            ],
         }
     }
 
@@ -1293,7 +1312,7 @@ fn bounded_source_snippet(
     })
 }
 
-fn transaction_from_proposal(
+pub(crate) fn transaction_from_proposal(
     proposal: &TransactionProposal,
     current_revision: u64,
 ) -> Result<WorkspaceTransaction, WorkspaceApiError> {
@@ -1318,7 +1337,7 @@ fn transaction_from_proposal(
     })
 }
 
-fn workspace_op_from_request(
+pub(crate) fn workspace_op_from_request(
     request: &WorkspaceOpRequest,
 ) -> Result<WorkspaceOp, WorkspaceApiError> {
     Ok(match request {
@@ -1351,7 +1370,7 @@ fn workspace_op_from_request(
     })
 }
 
-fn dry_run_diff(
+pub(crate) fn dry_run_diff(
     workspace: &Workspace,
     transaction: &WorkspaceTransaction,
 ) -> Result<SceneDiffView, WorkspaceApiError> {
@@ -1484,14 +1503,14 @@ fn build_scene_diff(
     }
 }
 
-fn scene_validation_error(error: geom_scene::SceneError) -> WorkspaceApiError {
+pub(crate) fn scene_validation_error(error: geom_scene::SceneError) -> WorkspaceApiError {
     WorkspaceApiError::Validation {
         message: error.to_string(),
         diagnostics: vec![diagnostic_from_scene_error(&error, None)],
     }
 }
 
-fn workspace_transaction_error(error: WorkspaceTransactionError) -> WorkspaceApiError {
+pub(crate) fn workspace_transaction_error(error: WorkspaceTransactionError) -> WorkspaceApiError {
     match error {
         WorkspaceTransactionError::SceneValidation { source } => scene_validation_error(source),
         other => WorkspaceApiError::Workspace {
@@ -1500,7 +1519,7 @@ fn workspace_transaction_error(error: WorkspaceTransactionError) -> WorkspaceApi
     }
 }
 
-fn rebuild_scope_from_targets(targets: &AffectedTargets) -> RebuildScopeView {
+pub(crate) fn rebuild_scope_from_targets(targets: &AffectedTargets) -> RebuildScopeView {
     RebuildScopeView {
         affected_node_ids: targets.node_ids().iter().map(ToString::to_string).collect(),
         affected_parameter_ids: targets

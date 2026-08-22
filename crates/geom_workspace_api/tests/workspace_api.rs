@@ -1,8 +1,11 @@
+use geom_scene::parse_scene;
 use geom_workspace::Workspace;
 use geom_workspace_api::protocol::{ApiProtocolRequest, dispatch};
 use geom_workspace_api::{
-    API_PROTOCOL_VERSION, CollectionBounds, EvaluateOutputRequest, NodeQuery, PreviewRequest,
-    RecentHistoryQuery, SourceSnippetRequest, TransactionProposal, WorkspaceApi,
+    API_PROTOCOL_VERSION, AiEditSessionPolicy, AiEditSessionStatus, AiProposalRevalidation,
+    AiProposalState, CollectionBounds, EvaluateOutputRequest, NodeQuery, PreviewRequest,
+    RecentHistoryQuery, SessionProposalQuery, SessionQuery, SourceSnippetRequest,
+    StartAiEditSessionRequest, SubmitAiProposalRequest, TransactionProposal, WorkspaceApi,
     WorkspaceOpRequest,
 };
 use serde_json::{Value, json};
@@ -269,6 +272,372 @@ fn invalid_proposal_returns_structured_diagnostics() {
 }
 
 #[test]
+fn session_model_and_review_flow_are_persisted_and_inspectable() {
+    let mut workspace = open_fixture_workspace();
+    let started = WorkspaceApi::start_ai_edit_session(
+        &workspace,
+        StartAiEditSessionRequest {
+            user_intent: "make the cap label more descriptive".to_owned(),
+            policy: AiEditSessionPolicy::ProposeOnly,
+        },
+    )
+    .expect("start session");
+    assert_eq!(started.value.status, AiEditSessionStatus::Open);
+    assert_eq!(started.value.base_revision, 0);
+    assert_eq!(
+        started.value.user_intent,
+        "make the cap label more descriptive"
+    );
+
+    let session_id = started.value.session_id.to_string();
+    let submitted = WorkspaceApi::submit_ai_proposal(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: Some("label the cap more clearly".to_owned()),
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("rename cap label".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("Review Cap".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("submit proposal");
+    assert_eq!(submitted.value.status, AiEditSessionStatus::AwaitingReview);
+    assert_eq!(submitted.value.proposals.len(), 1);
+    assert_eq!(
+        submitted.value.proposals[0].state,
+        AiProposalState::Proposed
+    );
+    assert_eq!(workspace.history_entries().expect("history").len(), 0);
+
+    let proposal_id = submitted.value.proposals[0].proposal_id.to_string();
+    let rejected = WorkspaceApi::reject_ai_proposal(
+        &workspace,
+        SessionProposalQuery {
+            session_id: session_id.clone(),
+            proposal_id,
+        },
+    )
+    .expect("reject proposal");
+    assert_eq!(rejected.value.proposals[0].state, AiProposalState::Rejected);
+    assert_eq!(rejected.value.rejected_proposal_ids.len(), 1);
+
+    let second_revision = workspace.revision().get();
+    let accepted_session = WorkspaceApi::submit_ai_proposal(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: Some("retry with a better label".to_owned()),
+            proposal: TransactionProposal {
+                expected_revision: second_revision,
+                actor: "ai".to_owned(),
+                intent: Some("rename cap label again".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("Accepted Cap".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("submit second proposal");
+    let second_proposal_id = accepted_session.value.proposals[1].proposal_id.to_string();
+    let accepted = WorkspaceApi::accept_ai_proposal(
+        &mut workspace,
+        SessionProposalQuery {
+            session_id,
+            proposal_id: second_proposal_id,
+        },
+    )
+    .expect("accept proposal");
+    assert_eq!(accepted.value.proposals[1].state, AiProposalState::Applied);
+    assert_eq!(accepted.value.accepted_proposal_ids.len(), 1);
+    assert_eq!(accepted.value.applied_changes.len(), 1);
+    assert!(accepted.value.restore_point.is_some());
+}
+
+#[test]
+fn stale_proposal_is_revalidated_or_marked_stale_safely() {
+    let mut workspace = open_fixture_workspace();
+    let started = WorkspaceApi::start_ai_edit_session(
+        &workspace,
+        StartAiEditSessionRequest {
+            user_intent: "tune labels".to_owned(),
+            policy: AiEditSessionPolicy::ProposeOnly,
+        },
+    )
+    .expect("start session");
+    let session_id = started.value.session_id.to_string();
+
+    let submitted = WorkspaceApi::submit_ai_proposal(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("rename cap".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("Stale Safe Cap".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("submit proposal");
+    let proposal_id = submitted.value.proposals[0].proposal_id.to_string();
+
+    let user_revision = workspace.revision().get();
+    WorkspaceApi::apply_transaction(
+        &mut workspace,
+        TransactionProposal {
+            expected_revision: user_revision,
+            actor: "user".to_owned(),
+            intent: Some("user changes body label".to_owned()),
+            operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                node_id: "body".to_owned(),
+                label: Some("Body User".to_owned()),
+            }],
+        },
+    )
+    .expect("user edit");
+
+    let accepted = WorkspaceApi::accept_ai_proposal(
+        &mut workspace,
+        SessionProposalQuery {
+            session_id: session_id.clone(),
+            proposal_id,
+        },
+    )
+    .expect("accept stale proposal");
+    assert_eq!(accepted.value.proposals[0].state, AiProposalState::Applied);
+    assert_eq!(
+        accepted.value.proposals[0].revalidation,
+        Some(AiProposalRevalidation::StaleButRevalidated)
+    );
+
+    let conflicting = WorkspaceApi::submit_ai_proposal(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("delete union".to_owned()),
+                operations: vec![WorkspaceOpRequest::DeleteNode {
+                    node_id: "union_shape".to_owned(),
+                }],
+            },
+        },
+    )
+    .expect("submit conflicting proposal");
+    assert_eq!(conflicting.value.proposals[1].state, AiProposalState::Stale);
+}
+
+#[test]
+fn auto_apply_cancellation_and_revert_behave_safely() {
+    let mut workspace = open_fixture_workspace();
+    let before_source = workspace.source_text().to_owned();
+    let started = WorkspaceApi::start_ai_edit_session(
+        &workspace,
+        StartAiEditSessionRequest {
+            user_intent: "make two quick ai edits".to_owned(),
+            policy: AiEditSessionPolicy::AutoApply,
+        },
+    )
+    .expect("start auto session");
+    let session_id = started.value.session_id.to_string();
+
+    let applied = WorkspaceApi::submit_live_ai_step(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: Some("first live step".to_owned()),
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("set cap label".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("Live Cap".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("live step");
+    assert_eq!(applied.value.applied_changes.len(), 1);
+    let history = workspace.history_entries().expect("history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0]
+            .correlation()
+            .and_then(|correlation| correlation.ai_session_id.as_deref()),
+        Some(session_id.as_str())
+    );
+
+    let cancelled = WorkspaceApi::cancel_ai_edit_session(
+        &workspace,
+        SessionQuery {
+            session_id: session_id.clone(),
+        },
+    )
+    .expect("cancel session");
+    assert_eq!(cancelled.value.status, AiEditSessionStatus::Cancelled);
+    let blocked_revision = workspace.revision().get();
+    let error = WorkspaceApi::submit_live_ai_step(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: blocked_revision,
+                actor: "ai".to_owned(),
+                intent: Some("should not apply".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "body".to_owned(),
+                    label: Some("Blocked".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect_err("cancelled session should reject new work");
+    assert!(matches!(
+        error,
+        geom_workspace_api::WorkspaceApiError::InvalidSessionState { .. }
+    ));
+
+    let mut fresh_workspace = open_fixture_workspace();
+    let revert_started = WorkspaceApi::start_ai_edit_session(
+        &fresh_workspace,
+        StartAiEditSessionRequest {
+            user_intent: "revertible ai session".to_owned(),
+            policy: AiEditSessionPolicy::AutoApply,
+        },
+    )
+    .expect("start revert session");
+    let revert_session_id = revert_started.value.session_id.to_string();
+    WorkspaceApi::submit_live_ai_step(
+        &mut fresh_workspace,
+        &revert_session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("cap label".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("Revert Me".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("apply revertible step");
+    let reverted = WorkspaceApi::revert_ai_edit_session(
+        &mut fresh_workspace,
+        SessionQuery {
+            session_id: revert_session_id,
+        },
+    )
+    .expect("revert session");
+    assert_eq!(reverted.value.status, AiEditSessionStatus::Reverted);
+    let reverted_scene = parse_scene(fresh_workspace.source_text()).expect("reverted scene");
+    let original_scene = parse_scene(&before_source).expect("original scene");
+    assert_eq!(reverted_scene, original_scene);
+}
+
+#[test]
+fn revert_conflict_preserves_interleaved_user_edits() {
+    let mut workspace = open_fixture_workspace();
+    let started = WorkspaceApi::start_ai_edit_session(
+        &workspace,
+        StartAiEditSessionRequest {
+            user_intent: "mixed ai and user".to_owned(),
+            policy: AiEditSessionPolicy::AutoApply,
+        },
+    )
+    .expect("start session");
+    let session_id = started.value.session_id.to_string();
+    WorkspaceApi::submit_live_ai_step(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("ai label".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("AI Cap".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("ai step");
+    let preserved_revision = workspace.revision().get();
+    WorkspaceApi::apply_transaction(
+        &mut workspace,
+        TransactionProposal {
+            expected_revision: preserved_revision,
+            actor: "user".to_owned(),
+            intent: Some("user body label".to_owned()),
+            operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                node_id: "body".to_owned(),
+                label: Some("Body Keep".to_owned()),
+            }],
+        },
+    )
+    .expect("user edit");
+    let error = WorkspaceApi::revert_ai_edit_session(&mut workspace, SessionQuery { session_id })
+        .expect_err("mixed history should conflict");
+    assert!(matches!(
+        error,
+        geom_workspace_api::WorkspaceApiError::RevertConflict { .. }
+    ));
+    assert!(workspace.source_text().contains("Body Keep"));
+}
+
+#[test]
+fn fail_on_approval_required_is_machine_readable() {
+    let mut workspace = open_fixture_workspace();
+    let started = WorkspaceApi::start_ai_edit_session(
+        &workspace,
+        StartAiEditSessionRequest {
+            user_intent: "headless fail instead of prompt".to_owned(),
+            policy: AiEditSessionPolicy::FailOnApprovalRequired,
+        },
+    )
+    .expect("start fail-on-approval session");
+    let session_id = started.value.session_id.to_string();
+    let session = WorkspaceApi::submit_ai_proposal(
+        &mut workspace,
+        &session_id,
+        SubmitAiProposalRequest {
+            rationale: None,
+            proposal: TransactionProposal {
+                expected_revision: 0,
+                actor: "ai".to_owned(),
+                intent: Some("needs approval".to_owned()),
+                operations: vec![WorkspaceOpRequest::SetNodeLabel {
+                    node_id: "cap".to_owned(),
+                    label: Some("No Prompt".to_owned()),
+                }],
+            },
+        },
+    )
+    .expect("submit under fail-on-approval policy");
+    assert_eq!(session.value.proposals[0].state, AiProposalState::Failed);
+    assert!(workspace.history_entries().expect("history").is_empty());
+}
+
+#[test]
 fn fake_agent_protocol_flow_uses_only_public_transport() {
     let workspace_root = clone_workspace_fixture();
     let mut child = Command::new(env!("CARGO_BIN_EXE_morphos-workspace-api"))
@@ -443,6 +812,185 @@ fn fake_agent_protocol_flow_uses_only_public_transport() {
             .expect("diagnostics array")
             .iter()
             .any(|diagnostic| diagnostic["blocking"] == true)
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait");
+    assert!(status.success());
+}
+
+#[test]
+fn m11_protocol_session_workflow_is_public_and_deterministic() {
+    let workspace_root = clone_workspace_fixture();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_morphos-workspace-api"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn protocol binary");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    let started = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-1",
+            "method": "start_edit_session",
+            "workspace_root": workspace_root,
+            "params": {
+                "user_intent": "protocol review workflow",
+                "policy": "propose_only"
+            }
+        }),
+    );
+    let session_id = started["result"]["value"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let submitted = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-2",
+            "method": "submit_proposal",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": session_id,
+                "request": {
+                    "rationale": "first review attempt",
+                    "proposal": {
+                        "expected_revision": 0,
+                        "actor": "ai",
+                        "intent": "first protocol proposal",
+                        "operations": [
+                            {
+                                "kind": "set_node_label",
+                                "node_id": "cap",
+                                "label": "Review Cap"
+                            }
+                        ]
+                    }
+                }
+            }
+        }),
+    );
+    let first_proposal_id = submitted["result"]["value"]["proposals"][0]["proposal_id"]
+        .as_str()
+        .expect("proposal id")
+        .to_owned();
+
+    let rejected = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-3",
+            "method": "reject_proposal",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": session_id,
+                "proposal_id": first_proposal_id
+            }
+        }),
+    );
+    assert_eq!(
+        rejected["result"]["value"]["proposals"][0]["state"],
+        "rejected"
+    );
+
+    let submitted_again = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-4",
+            "method": "submit_proposal",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": started["result"]["value"]["session_id"],
+                "request": {
+                    "rationale": "second review attempt",
+                    "proposal": {
+                        "expected_revision": 0,
+                        "actor": "ai",
+                        "intent": "second protocol proposal",
+                        "operations": [
+                            {
+                                "kind": "set_node_label",
+                                "node_id": "cap",
+                                "label": "Accepted Protocol Cap"
+                            }
+                        ]
+                    }
+                }
+            }
+        }),
+    );
+    let second_proposal_id = submitted_again["result"]["value"]["proposals"][1]["proposal_id"]
+        .as_str()
+        .expect("proposal id")
+        .to_owned();
+
+    let accepted = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-5",
+            "method": "accept_proposal",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": started["result"]["value"]["session_id"],
+                "proposal_id": second_proposal_id
+            }
+        }),
+    );
+    assert_eq!(
+        accepted["result"]["value"]["proposals"][1]["state"],
+        "applied"
+    );
+
+    let cancelled = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-6",
+            "method": "cancel_edit_session",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": started["result"]["value"]["session_id"]
+            }
+        }),
+    );
+    assert_eq!(cancelled["result"]["value"]["status"], "cancelled");
+
+    let events = send_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "version": API_PROTOCOL_VERSION,
+            "id": "m11-7",
+            "method": "get_edit_session_events",
+            "workspace_root": workspace_root,
+            "params": {
+                "session_id": started["result"]["value"]["session_id"],
+                "after_sequence": null,
+                "limit": 20
+            }
+        }),
+    );
+    assert!(
+        events["result"]["value"]["items"]
+            .as_array()
+            .expect("events")
+            .len()
+            >= 5
     );
 
     drop(stdin);

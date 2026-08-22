@@ -14,6 +14,7 @@ geom_diagnostics = { path = "../geom_diagnostics" }
 geom_geometry = { path = "../geom_geometry" }
 geom_scene = { path = "../geom_scene" }
 geom_workspace = { path = "../geom_workspace" }
+geom_workspace_api = { path = "../geom_workspace_api" }
 image = { version = "0.25.8", default-features = false, features = ["png"] }
 notify = "8.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
