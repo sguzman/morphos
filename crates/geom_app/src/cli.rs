@@ -1,11 +1,11 @@
 use crate::camera::{CameraFrame, OrbitCameraState};
 use bevy::prelude::{EulerRot, Quat, Vec3};
 use geom_diagnostics::{Diagnostic, DiagnosticReport};
-use geom_geometry::{BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh};
-use geom_geometry::{diagnostic_from_geometry_error, validate_evaluated_geometry};
-use geom_scene::{
-    Node, NodeId, ParamId, SceneDocument, parse_scene, parse_scene_report,
+use geom_geometry::{
+    BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh,
+    diagnostic_from_geometry_error, validate_backend_support, validate_evaluated_geometry,
 };
+use geom_scene::{Node, NodeId, ParamId, SceneDocument, parse_scene, parse_scene_report};
 use geom_workspace::{
     HistoryQuery, OperationId, SnapshotId, TransactionActor, Workspace, WorkspaceDirectory,
     WorkspaceHistoryEntry, WorkspaceOp, WorkspaceSceneChange, WorkspaceSceneDiff,
@@ -943,6 +943,15 @@ fn execute_command(command: Command) -> Result<String, CliError> {
         Command::Validate { workspace, format } => {
             let workspace = open_workspace(&workspace)?;
             let scene = parse_workspace_scene(&workspace, format)?;
+            let support_report = validate_backend_support(&scene);
+            if support_report.has_blocking() {
+                return Err(CliError::with_diagnostics(
+                    CliExitCode::Geometry,
+                    "geometry backend support validation failed",
+                    support_report,
+                    format,
+                ));
+            }
             render_output(
                 format,
                 render_validate_text(&workspace, &scene),
@@ -1914,7 +1923,10 @@ fn parse_workspace_scene(
     parse_scene_report(workspace.source_text()).map_err(|report| {
         CliError::with_diagnostics(
             CliExitCode::Source,
-            format!("scene validation failed for `{}`", workspace.root().display()),
+            format!(
+                "scene validation failed for `{}`",
+                workspace.root().display()
+            ),
             report,
             format,
         )
@@ -1926,6 +1938,15 @@ fn evaluate_scene(
     output: Option<&NodeId>,
     format: OutputFormat,
 ) -> Result<EvaluatedGeometry, CliError> {
+    let support_report = validate_backend_support(scene);
+    if support_report.has_blocking() {
+        return Err(CliError::with_diagnostics(
+            CliExitCode::Geometry,
+            "geometry backend support validation failed",
+            support_report,
+            format,
+        ));
+    }
     let mut evaluator = GeometryEvaluator::new(BoolmeshBackend::new());
     let evaluation = match output {
         Some(node) => evaluator.evaluate_node(scene, node),
@@ -2860,7 +2881,11 @@ mod tests {
     fn invalid_scene_returns_source_exit_code() {
         let workspace_root = clone_workspace_fixture();
         let source_path = workspace_root.join("source").join("scene.toml");
-        fs::write(&source_path, "schema_version = 1\nroot = \"broken\"\n").expect("write invalid");
+        fs::write(
+            &source_path,
+            "schema_version = 1\nroot = \"broken\"\n\n[nodes.box]\nkind = \"sphere\"\nradius = 1.0\ntransform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }\n",
+        )
+        .expect("write invalid");
 
         let result = run([
             OsString::from("morphos"),
@@ -2868,7 +2893,30 @@ mod tests {
             workspace_root.into_os_string(),
         ]);
         assert_eq!(result.exit_code, CliExitCode::Source);
-        assert!(result.stderr.contains("scene validation failed"));
+        assert!(result.stderr.contains("MORPHOS_INVALID_ROOT"));
+    }
+
+    #[test]
+    fn invalid_scene_json_emits_structured_diagnostics() {
+        let workspace_root = clone_workspace_fixture();
+        let source_path = workspace_root.join("source").join("scene.toml");
+        fs::write(
+            &source_path,
+            "schema_version = 1\nroot = \"broken\"\n\n[nodes.box]\nkind = \"sphere\"\nradius = 1.0\ntransform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }\n",
+        )
+        .expect("write invalid");
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("validate"),
+            workspace_root.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Source);
+        let parsed: Value = serde_json::from_str(&result.stderr).expect("json error");
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["diagnostics"][0]["code"], "MORPHOS_INVALID_ROOT");
+        assert_eq!(parsed["diagnostics"][0]["node_id"], "broken");
     }
 
     #[test]
@@ -2881,7 +2929,70 @@ mod tests {
             OsString::from("missing_output"),
         ]);
         assert_eq!(result.exit_code, CliExitCode::Geometry);
-        assert!(result.stderr.contains("geometry evaluation failed"));
+        assert!(result.stderr.contains("MORPHOS_UNKNOWN_OUTPUT"));
+    }
+
+    #[test]
+    fn unknown_output_json_emits_structured_geometry_diagnostics() {
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("eval"),
+            smoke_workspace_path().into_os_string(),
+            OsString::from("--output"),
+            OsString::from("missing_output"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Geometry);
+        let parsed: Value = serde_json::from_str(&result.stderr).expect("json error");
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["diagnostics"][0]["code"], "MORPHOS_UNKNOWN_OUTPUT");
+        assert_eq!(parsed["diagnostics"][0]["node_id"], "missing_output");
+    }
+
+    #[test]
+    fn validate_reports_unsupported_backend_capability_in_json() {
+        let workspace_root = clone_workspace_fixture();
+        let source_path = workspace_root.join("source").join("scene.toml");
+        fs::write(
+            &source_path,
+            "schema_version = 1\nroot = \"plane\"\n\n[nodes.plane]\nkind = \"plane\"\nwidth = 2.0\ndepth = 3.0\ntransform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }\n",
+        )
+        .expect("write unsupported scene");
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("validate"),
+            workspace_root.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Geometry);
+        let parsed: Value = serde_json::from_str(&result.stderr).expect("json error");
+        assert_eq!(
+            parsed["diagnostics"][0]["code"],
+            "MORPHOS_UNSUPPORTED_GEOMETRY"
+        );
+        assert_eq!(parsed["diagnostics"][0]["node_id"], "plane");
+    }
+
+    #[test]
+    fn invalid_scene_text_includes_stable_code_and_context() {
+        let workspace_root = clone_workspace_fixture();
+        let source_path = workspace_root.join("source").join("scene.toml");
+        fs::write(
+            &source_path,
+            "schema_version = 1\nroot = \"broken\"\n\n[nodes.box]\nkind = \"sphere\"\nradius = 1.0\ntransform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }\n",
+        )
+        .expect("write invalid");
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("validate"),
+            workspace_root.into_os_string(),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Source);
+        assert!(result.stderr.contains("MORPHOS_INVALID_ROOT"));
+        assert!(result.stderr.contains("root node `broken` does not exist"));
+        assert!(result.stderr.contains("node broken"));
     }
 
     #[test]

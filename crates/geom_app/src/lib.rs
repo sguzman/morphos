@@ -509,7 +509,14 @@ fn ui_system(
                             ));
                             ui.label(&diagnostic.message);
                             if let Some(node_id) = &diagnostic.node_id {
-                                ui.label(format!("Node: {node_id}"));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Node: {node_id}"));
+                                    if ui.button("Select Node").clicked()
+                                        && let Ok(node_id) = NodeId::new(node_id.clone())
+                                    {
+                                        commands.write(AppCommand::SelectNode(Some(node_id)));
+                                    }
+                                });
                             }
                             if let Some(parameter_id) = &diagnostic.parameter_id {
                                 ui.label(format!("Parameter: {parameter_id}"));
@@ -517,7 +524,16 @@ fn ui_system(
                             if let Some(source) = &diagnostic.source
                                 && let (Some(line), Some(column)) = (source.line, source.column)
                             {
-                                ui.label(format!("Source: line {line}, column {column}"));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Source: line {line}, column {column}"));
+                                    if ui.button("Copy Source Location").clicked() {
+                                        let path = source
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or("source/scene.toml");
+                                        ui.ctx().copy_text(format!("{path}:{line}:{column}"));
+                                    }
+                                });
                             }
                             for note in &diagnostic.notes {
                                 ui.label(format!("Note: {note}"));

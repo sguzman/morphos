@@ -1014,7 +1014,10 @@ pub fn validate_evaluated_geometry(geometry: &EvaluatedGeometry) -> DiagnosticRe
         diagnostics.push(
             Diagnostic::error(
                 DiagnosticCode::empty_geometry(),
-                format!("geometry evaluation for `{}` produced an empty mesh", geometry.requested_output),
+                format!(
+                    "geometry evaluation for `{}` produced an empty mesh",
+                    geometry.requested_output
+                ),
             )
             .with_node_id(geometry.requested_output.as_str()),
         );
@@ -1038,21 +1041,53 @@ pub fn validate_evaluated_geometry(geometry: &EvaluatedGeometry) -> DiagnosticRe
         }
     }
 
-    if let Some(size) = geometry.bounds.size() {
-        if size.iter().any(|value| !value.is_finite()) {
-            diagnostics.push(
-                Diagnostic::error(
-                    DiagnosticCode::invalid_mesh(),
-                    format!(
-                        "geometry evaluation for `{}` produced non-finite bounds",
-                        geometry.requested_output
-                    ),
-                )
-                .with_node_id(geometry.requested_output.as_str()),
-            );
-        }
+    if let Some(size) = geometry.bounds.size()
+        && size.iter().any(|value| !value.is_finite())
+    {
+        diagnostics.push(
+            Diagnostic::error(
+                DiagnosticCode::invalid_mesh(),
+                format!(
+                    "geometry evaluation for `{}` produced non-finite bounds",
+                    geometry.requested_output
+                ),
+            )
+            .with_node_id(geometry.requested_output.as_str()),
+        );
     }
 
+    DiagnosticReport::new(diagnostics)
+}
+
+pub fn validate_backend_support(scene: &SceneDocument) -> DiagnosticReport {
+    let mut diagnostics = Vec::new();
+    for node in scene.nodes().values() {
+        match node.kind() {
+            NodeKind::Plane(_) => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::unsupported_geometry(),
+                    format!(
+                        "node `{}` uses `plane`, which the current geometry backend does not support",
+                        node.id()
+                    ),
+                )
+                .with_node_id(node.id().as_str())
+                .with_remediation("Replace `plane` with a backend-supported primitive."),
+            ),
+            NodeKind::Profile(_) => diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::unsupported_geometry(),
+                    format!(
+                        "node `{}` uses `profile`, which the current geometry backend does not support",
+                        node.id()
+                    ),
+                )
+                .with_node_id(node.id().as_str())
+                .with_remediation("Replace `profile` with a backend-supported primitive."),
+            ),
+            _ => {}
+        }
+    }
     DiagnosticReport::new(diagnostics)
 }
 
@@ -2167,5 +2202,63 @@ transform = { translate = { x = 5.0, y = 1.0, z = 0.0 }, rotate_deg = { x = 0.0,
                 evaluator.evaluate_root(&scene).expect("bench evaluation");
             });
         });
+    }
+
+    #[test]
+    fn geometry_error_normalization_preserves_code_and_node_context() {
+        let node = NodeId::new("plane").expect("node");
+        let diagnostic = diagnostic_from_geometry_error(&GeometryError::new(
+            GeometryErrorKind::UnsupportedShape { shape: "plane" },
+            Some(node.clone()),
+        ));
+
+        assert_eq!(diagnostic.code.0, "MORPHOS_UNSUPPORTED_GEOMETRY");
+        assert_eq!(diagnostic.node_id.as_deref(), Some(node.as_str()));
+        assert!(diagnostic.remediation.is_some());
+    }
+
+    #[test]
+    fn validate_evaluated_geometry_reports_empty_mesh() {
+        let geometry = EvaluatedGeometry {
+            requested_output: NodeId::new("root").expect("node"),
+            mesh: Mesh::new(Vec::new(), Vec::new()).expect("empty mesh is valid container"),
+            bounds: Bounds::Empty,
+            stats: GeometryStats {
+                vertex_count: 0,
+                triangle_count: 0,
+                evaluated_node_count: 1,
+                cache_hits: 0,
+                cache_misses: 1,
+            },
+            resolved_parameters: IndexMap::new(),
+            participating_node_ids: Vec::new(),
+            evaluation_revision: 1,
+        };
+
+        let report = validate_evaluated_geometry(&geometry);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code.0, "MORPHOS_EMPTY_GEOMETRY");
+    }
+
+    #[test]
+    fn validate_backend_support_reports_unsupported_placeholders() {
+        let scene = parse_scene(
+            r#"
+schema_version = 1
+root = "plane"
+
+[nodes.plane]
+kind = "plane"
+width = 2.0
+depth = 3.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#,
+        )
+        .expect("parse");
+
+        let report = validate_backend_support(&scene);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].code.0, "MORPHOS_UNSUPPORTED_GEOMETRY");
+        assert_eq!(report.diagnostics[0].node_id.as_deref(), Some("plane"));
     }
 }

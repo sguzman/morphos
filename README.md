@@ -9,19 +9,21 @@ passes. When a blocker or follow-up is discovered during implementation, record 
 relevant milestone instead of silently skipping it or pulling later-milestone scope forward.
 
 Current implementation status: the repository now includes the durable `geom_workspace`
-foundation from M01, the declarative `geom_scene` schema layer from M02, and the headless
-`geom_geometry` evaluation layer from M03. Morphos can create, open, inspect, mutate, save, and
-reopen a workspace; parse, validate, canonically serialize, and source-edit versioned TOML scene
-documents; deterministically evaluate a validated `SceneDocument` into Morphos-owned mesh,
-bounds, and statistics results through a backend-neutral geometry API with selective evaluation
-and dependency-aware caching; launch the first desktop viewport shell through `geom_app`; and
-reactively rebuild the viewport from external or in-app source edits through a watched
-`source/scene.toml` loop with last-good preview preservation, stale-result suppression, and
-timing instrumentation; directly author the current scene schema through a scene tree, inspector,
-parameter controls, and basic structural editing while TOML remains canonical; and route current
-scene mutations through a structured workspace-transaction foundation with typed operations,
-atomic validation/apply behavior, actor metadata, and affected-target reporting. Undo/history,
-CLI product commands, and AI integration remain future work.
+foundation from M01, the declarative `geom_scene` schema layer from M02, the headless
+`geom_geometry` evaluation layer from M03, the M08 headless CLI/export/automation surface, and
+the M09 shared validation/diagnostics foundation. Morphos can create, open, inspect, mutate,
+save, and reopen a workspace; parse, validate, canonically serialize, and source-edit versioned
+TOML scene documents; deterministically evaluate a validated `SceneDocument` into Morphos-owned
+mesh, bounds, and statistics results through a backend-neutral geometry API with selective
+evaluation and dependency-aware caching; normalize scene and geometry failures into stable
+serializable diagnostics shared by the CLI and desktop UI; launch the desktop viewport shell
+through `geom_app`; reactively rebuild the viewport from external or in-app source edits through a
+watched `source/scene.toml` loop with last-good preview preservation, stale-result suppression,
+and timing instrumentation; directly author the current scene schema through a scene tree,
+inspector, parameter controls, and basic structural editing while TOML remains canonical; and
+route current scene mutations through a structured workspace-transaction foundation with typed
+operations, atomic validation/apply behavior, actor metadata, and affected-target reporting.
+Undo/history provenance refinement and AI integration remain future work.
 
 ## Architecture invariants
 
@@ -42,6 +44,8 @@ CLI product commands, and AI integration remain future work.
   canonical serialization, and source-preserving edits.
 - `crates/geom_geometry`: the backend-neutral geometry IR, evaluation graph, cache, and headless
   mesh-generation crate introduced in M03.
+- `crates/geom_diagnostics`: the shared presentation-neutral diagnostic data model and report
+  contract introduced in M09.
 - `crates/geom_app`: the M05 desktop viewport shell built with Bevy 0.19.1 and bevy_egui 0.41.1,
   including reactive file watching and build orchestration.
 - `docs/architecture.md`: the bootstrap architecture contract and development rules.
@@ -54,6 +58,8 @@ CLI product commands, and AI integration remain future work.
   suppression, timing harness, and reactive verification procedure.
 - `docs/authoring-ui.md`: the M06 scene-tree, inspector, parameter, structural-editing, and
   invalid-source authoring behavior.
+- `docs/diagnostics.md`: the M09 shared diagnostic model, validation flow, geometry normalization,
+  CLI/GUI rendering, and last-good semantics.
 - `docs/workspace-transactions.md`: the M07 transaction foundation, actor model, atomic apply
   behavior, and GUI integration boundary.
 - `milestones/`: canonical milestone files and milestone index.

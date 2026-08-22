@@ -193,11 +193,15 @@ impl DiagnosticReport {
     }
 
     pub fn has_blocking(&self) -> bool {
-        self.diagnostics.iter().any(|diagnostic| diagnostic.blocking)
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.blocking)
     }
 
     pub fn primary_message(&self) -> Option<&str> {
-        self.diagnostics.first().map(|diagnostic| diagnostic.message.as_str())
+        self.diagnostics
+            .first()
+            .map(|diagnostic| diagnostic.message.as_str())
     }
 }
 
@@ -240,5 +244,26 @@ mod tests {
         assert_eq!(decoded, report);
         assert!(decoded.has_blocking());
         assert_eq!(decoded.primary_message(), Some("bad value"));
+    }
+
+    #[test]
+    fn report_blocking_and_ordering_are_deterministic() {
+        let mut warning = Diagnostic::error(DiagnosticCode::unsupported_geometry(), "warning-ish");
+        warning.severity = DiagnosticSeverity::Warning;
+        warning.blocking = false;
+
+        let error = Diagnostic::error(DiagnosticCode::invalid_value(), "blocking");
+        let report = DiagnosticReport::new(vec![warning.clone(), error.clone()]);
+
+        assert!(report.has_blocking());
+        assert_eq!(report.primary_message(), Some("warning-ish"));
+
+        let encoded = serde_json::to_value(&report).expect("to value");
+        assert_eq!(encoded["diagnostics"][0]["severity"], "warning");
+        assert_eq!(
+            encoded["diagnostics"][0]["code"],
+            "MORPHOS_UNSUPPORTED_GEOMETRY"
+        );
+        assert_eq!(encoded["diagnostics"][1]["severity"], "error");
     }
 }

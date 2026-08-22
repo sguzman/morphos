@@ -1218,9 +1218,10 @@ pub fn diagnostic_from_scene_error(error: &SceneError, source_path: Option<&str>
                 None => format!("missing required field `{field}`"),
             },
         ),
-        SceneErrorKind::UnknownField { path } => {
-            Diagnostic::error(DiagnosticCode::unknown_field(), format!("unknown field `{path}`"))
-        }
+        SceneErrorKind::UnknownField { path } => Diagnostic::error(
+            DiagnosticCode::unknown_field(),
+            format!("unknown field `{path}`"),
+        ),
         SceneErrorKind::InvalidIdentifier { kind, value } => Diagnostic::error(
             DiagnosticCode::invalid_id(),
             format!("invalid {kind} identifier `{value}`"),
@@ -1391,15 +1392,45 @@ fn validate_node_references_pass(scene: &SceneDocument, diagnostics: &mut Vec<Di
                 validate_vector3_refs(&primitive.size, scene, diagnostics, node.id(), "size");
             }
             NodeKind::Sphere(primitive) => {
-                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_scalar_expr_refs(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
             }
             NodeKind::Cylinder(primitive) => {
-                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
-                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_scalar_expr_refs(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
+                validate_scalar_expr_refs(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Capsule(primitive) => {
-                validate_scalar_expr_refs(&primitive.radius, scene, diagnostics, node.id(), "radius");
-                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_scalar_expr_refs(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
+                validate_scalar_expr_refs(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Plane(primitive) => {
                 validate_scalar_expr_refs(&primitive.width, scene, diagnostics, node.id(), "width");
@@ -1407,7 +1438,13 @@ fn validate_node_references_pass(scene: &SceneDocument, diagnostics: &mut Vec<Di
             }
             NodeKind::Profile(primitive) => {
                 validate_scalar_expr_refs(&primitive.width, scene, diagnostics, node.id(), "width");
-                validate_scalar_expr_refs(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_scalar_expr_refs(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Union(composition)
             | NodeKind::Difference(composition)
@@ -1475,15 +1512,45 @@ fn validate_primitives_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnos
                 validate_positive_vector3(&primitive.size, scene, diagnostics, node.id(), "size");
             }
             NodeKind::Sphere(primitive) => {
-                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
+                validate_positive_scalar(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
             }
             NodeKind::Cylinder(primitive) => {
-                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
-                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_positive_scalar(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
+                validate_positive_scalar(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Capsule(primitive) => {
-                validate_positive_scalar(&primitive.radius, scene, diagnostics, node.id(), "radius");
-                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_positive_scalar(
+                    &primitive.radius,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "radius",
+                );
+                validate_positive_scalar(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Plane(primitive) => {
                 validate_positive_scalar(&primitive.width, scene, diagnostics, node.id(), "width");
@@ -1491,7 +1558,13 @@ fn validate_primitives_pass(scene: &SceneDocument, diagnostics: &mut Vec<Diagnos
             }
             NodeKind::Profile(primitive) => {
                 validate_positive_scalar(&primitive.width, scene, diagnostics, node.id(), "width");
-                validate_positive_scalar(&primitive.height, scene, diagnostics, node.id(), "height");
+                validate_positive_scalar(
+                    &primitive.height,
+                    scene,
+                    diagnostics,
+                    node.id(),
+                    "height",
+                );
             }
             NodeKind::Union(_) | NodeKind::Difference(_) | NodeKind::Intersection(_) => {}
         }
@@ -1553,9 +1626,27 @@ fn validate_vector3_refs(
     node_id: &NodeId,
     context: &str,
 ) {
-    validate_scalar_expr_refs(&vector.x, scene, diagnostics, node_id, &format!("{context}.x"));
-    validate_scalar_expr_refs(&vector.y, scene, diagnostics, node_id, &format!("{context}.y"));
-    validate_scalar_expr_refs(&vector.z, scene, diagnostics, node_id, &format!("{context}.z"));
+    validate_scalar_expr_refs(
+        &vector.x,
+        scene,
+        diagnostics,
+        node_id,
+        &format!("{context}.x"),
+    );
+    validate_scalar_expr_refs(
+        &vector.y,
+        scene,
+        diagnostics,
+        node_id,
+        &format!("{context}.y"),
+    );
+    validate_scalar_expr_refs(
+        &vector.z,
+        scene,
+        diagnostics,
+        node_id,
+        &format!("{context}.z"),
+    );
 }
 
 fn validate_scalar_expr_refs(
@@ -1587,7 +1678,10 @@ fn validate_scalar_expr_refs(
 fn literal_or_parameter_value(expr: &ScalarExpr, scene: &SceneDocument) -> Option<f64> {
     match expr {
         ScalarExpr::Literal(value) => Some(*value),
-        ScalarExpr::Parameter(parameter) => scene.parameters().get(parameter.target()).map(|entry| entry.scalar_value()),
+        ScalarExpr::Parameter(parameter) => scene
+            .parameters()
+            .get(parameter.target())
+            .map(|entry| entry.scalar_value()),
     }
 }
 
@@ -1599,7 +1693,13 @@ fn validate_positive_vector3(
     context: &str,
 ) {
     for (axis, expr) in [("x", &vector.x), ("y", &vector.y), ("z", &vector.z)] {
-        validate_positive_scalar(expr, scene, diagnostics, node_id, &format!("{context}.{axis}"));
+        validate_positive_scalar(
+            expr,
+            scene,
+            diagnostics,
+            node_id,
+            &format!("{context}.{axis}"),
+        );
     }
 }
 
@@ -3597,5 +3697,86 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
             .expect("delete");
         assert!(!scene.text().contains("[nodes.deletable]"));
         assert!(scene.text().contains("[nodes.other]"));
+    }
+
+    #[test]
+    fn parse_scene_report_preserves_source_span_for_parse_error() {
+        let report = parse_scene_report(
+            r#"
+schema_version = 1
+root = "box
+
+[nodes.box]
+kind = "box"
+size = { x = 1.0, y = 1.0, z = 1.0 }
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#,
+        )
+        .expect_err("parse error should report");
+
+        assert_eq!(report.diagnostics[0].code.0, "MORPHOS_SOURCE_PARSE");
+        let source = report.diagnostics[0].source.as_ref().expect("source");
+        assert_eq!(source.line, Some(3));
+        assert_eq!(source.column, Some(12));
+    }
+
+    #[test]
+    fn parse_scene_report_surfaces_broken_parameter_reference() {
+        let report = parse_scene_report(
+            r#"
+schema_version = 1
+root = "a"
+
+[params.width]
+type = "scalar"
+value = 1.0
+
+[nodes.a]
+kind = "union"
+children = ["b", "b"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = { param = "missing_scale" }, y = 1.0, z = 1.0 } }
+
+[nodes.b]
+kind = "sphere"
+radius = 1.0
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#,
+        )
+        .expect_err("missing parameter should report");
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.0 == "MORPHOS_BROKEN_PARAMETER_REFERENCE")
+        );
+    }
+
+    #[test]
+    fn parse_scene_report_surfaces_dependency_cycle() {
+        let report = parse_scene_report(
+            r#"
+schema_version = 1
+root = "a"
+
+[nodes.a]
+kind = "union"
+children = ["b", "b"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+
+[nodes.b]
+kind = "union"
+children = ["a", "a"]
+transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0, y = 0.0, z = 0.0 }, scale = { x = 1.0, y = 1.0, z = 1.0 } }
+"#,
+        )
+        .expect_err("cycle should report");
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.0 == "MORPHOS_DEPENDENCY_CYCLE")
+        );
     }
 }

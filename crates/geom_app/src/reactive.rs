@@ -3,11 +3,10 @@ use crate::viewport::DisplayGeometryRevision;
 use blake3::Hasher;
 use geom_diagnostics::{DiagnosticReport, DiagnosticTiming};
 use geom_geometry::{
-    BoolmeshBackend, GeometryEvaluator, diagnostic_from_geometry_error, validate_evaluated_geometry,
+    BoolmeshBackend, GeometryEvaluator, diagnostic_from_geometry_error, validate_backend_support,
+    validate_evaluated_geometry,
 };
-use geom_scene::{
-    NodeId, ParamId, SceneDocument, parse_scene_report,
-};
+use geom_scene::{NodeId, ParamId, SceneDocument, parse_scene_report};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -555,15 +554,11 @@ impl BuildWorker {
                 attach_timings(
                     &mut report,
                     ReactiveBuildTimings {
-                        parse_millis: now
-                            .saturating_duration_since(parse_started)
-                            .as_secs_f64()
+                        parse_millis: now.saturating_duration_since(parse_started).as_secs_f64()
                             * 1_000.0,
                         evaluation_millis: 0.0,
                         mesh_upload_millis: 0.0,
-                        total_millis: now
-                            .saturating_duration_since(total_started)
-                            .as_secs_f64()
+                        total_millis: now.saturating_duration_since(total_started).as_secs_f64()
                             * 1_000.0,
                     },
                 );
@@ -605,6 +600,40 @@ impl BuildWorker {
             .unwrap_or(true);
         let (changed_node_ids, changed_parameter_ids) =
             changed_ids(self.last_successful_scene.as_ref(), &scene);
+
+        let mut support_report = validate_backend_support(&scene);
+        if support_report.has_blocking() {
+            let now = Instant::now();
+            attach_timings(
+                &mut support_report,
+                ReactiveBuildTimings {
+                    parse_millis,
+                    evaluation_millis: 0.0,
+                    mesh_upload_millis: 0.0,
+                    total_millis: now.saturating_duration_since(total_started).as_secs_f64()
+                        * 1_000.0,
+                },
+            );
+            return BuildOutcome {
+                session_id: request.session_id,
+                generation: request.generation,
+                source_revision: request.source_revision,
+                source_fingerprint: request.source_fingerprint,
+                origin: request.origin,
+                requested_at: request.requested_at,
+                kind: BuildOutcomeKind::Failure {
+                    stage: DiagnosticStage::Geometry,
+                    report: support_report,
+                    timings: ReactiveBuildTimings {
+                        parse_millis,
+                        evaluation_millis: 0.0,
+                        mesh_upload_millis: 0.0,
+                        total_millis: now.saturating_duration_since(total_started).as_secs_f64()
+                            * 1_000.0,
+                    },
+                },
+            };
+        }
 
         if !semantic_scene_changed {
             let total_millis = Instant::now()
@@ -711,9 +740,7 @@ impl BuildWorker {
                             .as_secs_f64()
                             * 1_000.0,
                         mesh_upload_millis: 0.0,
-                        total_millis: now
-                            .saturating_duration_since(total_started)
-                            .as_secs_f64()
+                        total_millis: now.saturating_duration_since(total_started).as_secs_f64()
                             * 1_000.0,
                     },
                 );

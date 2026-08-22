@@ -671,15 +671,13 @@ impl AppModel {
             report,
         });
         self.build_status = match stage {
-            DiagnosticStage::Workspace => {
-                AppBuildStatus::WorkspaceError(
-                    diagnostic
-                        .report
-                        .primary_message()
-                        .unwrap_or("workspace error")
-                        .to_owned(),
-                )
-            }
+            DiagnosticStage::Workspace => AppBuildStatus::WorkspaceError(
+                diagnostic
+                    .report
+                    .primary_message()
+                    .unwrap_or("workspace error")
+                    .to_owned(),
+            ),
             DiagnosticStage::Conflict => AppBuildStatus::Conflict(
                 diagnostic
                     .report
