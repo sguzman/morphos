@@ -181,6 +181,21 @@ Current policy:
 This keeps canonical scene state conservative and avoids silently accepting unaudited edits, while
 remaining simple enough for deterministic tests.
 
+## External-edit policy
+
+Raw external TOML edits are intentionally outside durable transaction history in this tranche.
+
+When Morphos observes an external source reload, it:
+
+- reloads the canonical source text
+- clears the in-memory undo/redo stacks
+- does not synthesize fake `WorkspaceOp` history entries from the text diff
+
+That boundary is conservative on purpose. Morphos does not yet have a reliable semantic derivation
+step that can turn arbitrary external text edits into truthful structured transaction provenance, so
+this tranche leaves those edits outside the durable audit log instead of fabricating misleading
+history.
+
 ## Affected targets
 
 Each operation reports its affected mutation targets, and the transaction commit returns their

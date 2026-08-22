@@ -3263,11 +3263,12 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
     #[test]
     fn committed_transactions_persist_durable_history_and_reload_in_order() {
         let mut workspace = transaction_workspace();
+        let first_operation_id = OperationId::new();
         let first = WorkspaceTransaction::new(
             TransactionActor::User,
             Some("Tune width".to_owned()),
             vec![WorkspaceOp::SetParameterScalar {
-                id: OperationId::new(),
+                id: first_operation_id.clone(),
                 parameter_id: ParamId::new("width").expect("width"),
                 value: 4.5,
             }],
@@ -3295,6 +3296,7 @@ transform = { translate = { x = 0.0, y = 0.0, z = 0.0 }, rotate_deg = { x = 0.0,
         assert_eq!(history[0].revision_before(), first_commit.revision_before());
         assert_eq!(history[0].revision_after(), first_commit.revision_after());
         assert_eq!(history[0].operations()[0].kind(), "set_parameter_scalar");
+        assert_eq!(history[0].operations()[0].id(), &first_operation_id);
         assert!(
             history[0]
                 .affected_targets()
