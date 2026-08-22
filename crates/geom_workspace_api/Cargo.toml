@@ -1,0 +1,19 @@
+[package]
+name = "geom_workspace_api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+geom_diagnostics = { path = "../geom_diagnostics" }
+geom_geometry = { path = "../geom_geometry" }
+geom_scene = { path = "../geom_scene" }
+geom_workspace = { path = "../geom_workspace" }
+image = { version = "0.25.8", default-features = false, features = ["png"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0"
+
+[lints]
+workspace = true

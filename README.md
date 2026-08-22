@@ -10,20 +10,21 @@ relevant milestone instead of silently skipping it or pulling later-milestone sc
 
 Current implementation status: the repository now includes the durable `geom_workspace`
 foundation from M01, the declarative `geom_scene` schema layer from M02, the headless
-`geom_geometry` evaluation layer from M03, the M08 headless CLI/export/automation surface, and
-the M09 shared validation/diagnostics foundation. Morphos can create, open, inspect, mutate,
-save, and reopen a workspace; parse, validate, canonically serialize, and source-edit versioned
-TOML scene documents; deterministically evaluate a validated `SceneDocument` into Morphos-owned
-mesh, bounds, and statistics results through a backend-neutral geometry API with selective
-evaluation and dependency-aware caching; normalize scene and geometry failures into stable
-serializable diagnostics shared by the CLI and desktop UI; launch the desktop viewport shell
-through `geom_app`; reactively rebuild the viewport from external or in-app source edits through a
-watched `source/scene.toml` loop with last-good preview preservation, stale-result suppression,
-and timing instrumentation; directly author the current scene schema through a scene tree,
-inspector, parameter controls, and basic structural editing while TOML remains canonical; and
-route current scene mutations through a structured workspace-transaction foundation with typed
-operations, atomic validation/apply behavior, actor metadata, and affected-target reporting.
-Undo/history provenance refinement and AI integration remain future work.
+`geom_geometry` evaluation layer from M03, the M08 headless CLI/export/automation surface, the
+M09 shared validation/diagnostics foundation, and the M10 structured workspace API. Morphos can
+create, open, inspect, mutate, save, and reopen a workspace; parse, validate, canonically
+serialize, and source-edit versioned TOML scene documents; deterministically evaluate a validated
+`SceneDocument` into Morphos-owned mesh, bounds, and statistics results through a backend-neutral
+geometry API with selective evaluation and dependency-aware caching; normalize scene and geometry
+failures into stable serializable diagnostics shared by the CLI and desktop UI; launch the desktop
+viewport shell through `geom_app`; reactively rebuild the viewport from external or in-app source
+edits through a watched `source/scene.toml` loop with last-good preview preservation,
+stale-result suppression, and timing instrumentation; directly author the current scene schema
+through a scene tree, inspector, parameter controls, and basic structural editing while TOML
+remains canonical; route scene mutations through a structured workspace-transaction foundation
+with typed operations, atomic validation/apply behavior, actor metadata, and affected-target
+reporting; and expose the same workspace state through a bounded, provider-independent Rust API
+and headless stdio JSON protocol for automation and AI agents.
 
 ## Architecture invariants
 
@@ -46,6 +47,8 @@ Undo/history provenance refinement and AI integration remain future work.
   mesh-generation crate introduced in M03.
 - `crates/geom_diagnostics`: the shared presentation-neutral diagnostic data model and report
   contract introduced in M09.
+- `crates/geom_workspace_api`: the M10 provider-independent workspace API and stdio protocol for
+  bounded reads, revision-safe mutations, previews, and automation tooling.
 - `crates/geom_app`: the M05 desktop viewport shell built with Bevy 0.19.1 and bevy_egui 0.41.1,
   including reactive file watching and build orchestration.
 - `docs/architecture.md`: the bootstrap architecture contract and development rules.
@@ -60,6 +63,8 @@ Undo/history provenance refinement and AI integration remain future work.
   invalid-source authoring behavior.
 - `docs/diagnostics.md`: the M09 shared diagnostic model, validation flow, geometry normalization,
   CLI/GUI rendering, and last-good semantics.
+- `docs/workspace-api.md`: the M10 structured workspace API architecture, bounding rules,
+  revision contract, protocol transport, and example agent interaction.
 - `docs/workspace-transactions.md`: the M07 transaction foundation, actor model, atomic apply
   behavior, and GUI integration boundary.
 - `milestones/`: canonical milestone files and milestone index.
@@ -83,6 +88,7 @@ Undo/history provenance refinement and AI integration remain future work.
 - Test: `cargo test --workspace`
 - Format: `cargo fmt --check`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
+- Launch the stdio workspace API: `cargo run -p geom_workspace_api --bin morphos-workspace-api`
 - Launch the viewport shell: `cargo run -p geom_app -- examples/workspaces/viewport-smoke`
 - Launch the authoring smoke workspace: `cargo run -p geom_app -- examples/workspaces/authoring-smoke`
 - Measure reactive timings: `cargo test -p geom_app reactive_timing_harness -- --ignored --nocapture`

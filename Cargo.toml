@@ -5,6 +5,7 @@ members = [
     "crates/geom_geometry",
     "crates/geom_scene",
     "crates/geom_workspace",
+    "crates/geom_workspace_api",
 ]
 resolver = "3"
 
