@@ -1786,9 +1786,7 @@ fn poll_build_results_system(
     while let Ok(outcome) = receiver.try_recv() {
         let action = app_model.accept_build_outcome(outcome);
         if action.refresh_displayed_geometry() {
-            if let Some(displayed) = app_model.displayed_geometry() {
-                viewport.accept_displayed_geometry(displayed);
-            }
+            // Do not mark the geometry revision as displayed until the Bevy mesh upload succeeds.
             app_model.preserve_selection(&mut viewport.selection);
             runtime.pending_mesh_upload_requested_at = action.requested_at();
         }
