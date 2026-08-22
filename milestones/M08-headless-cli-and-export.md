@@ -39,23 +39,23 @@ Owns CLI commands, non-GUI execution, deterministic export, and batch-friendly e
 
 ### Structured operation tooling
 
-- [ ] Add a command to apply a serialized `WorkspaceOp` transaction.
-- [ ] Add a dry-run mode that validates and prints the diff without committing.
-- [ ] Add a command to print history/recent revisions.
-- [ ] Add snapshot create/list/restore commands.
+- [x] Add a command to apply a serialized `WorkspaceOp` transaction.
+- [x] Add a dry-run mode that validates and prints the diff without committing.
+- [x] Add a command to print history/recent revisions.
+- [x] Add snapshot create/list/restore commands.
 
 ### Batch and automation ergonomics
 
 - [x] Support JSON output for commands intended for agent/tool consumption.
-- [ ] Avoid prompts in machine mode.
-- [ ] Make stdout/stderr behavior predictable.
-- [ ] Add an example script that batch-exports multiple workspaces/variants.
+- [x] Avoid prompts in machine mode.
+- [x] Make stdout/stderr behavior predictable.
+- [x] Add an example script that batch-exports multiple workspaces/variants.
 
 ### Tests
 
 - [x] Add CLI integration tests for validate/inspect/export.
 - [x] Add deterministic output tests where practical.
-- [ ] Add operation dry-run/apply tests.
+- [x] Add operation dry-run/apply tests.
 - [x] Add non-zero exit-code tests for invalid workspaces.
 
 ## Completion criteria

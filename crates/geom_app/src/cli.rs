@@ -1,11 +1,17 @@
 use geom_geometry::{BoolmeshBackend, Bounds, EvaluatedGeometry, GeometryEvaluator, Mesh};
-use geom_scene::{NodeId, SceneDocument, parse_scene};
-use geom_workspace::{Workspace, WorkspaceDirectory};
+use geom_scene::{Node, NodeId, ParamId, SceneDocument, parse_scene};
+use geom_workspace::{
+    HistoryQuery, OperationId, SnapshotId, TransactionActor, Workspace, WorkspaceDirectory,
+    WorkspaceHistoryEntry, WorkspaceOp, WorkspaceSceneChange, WorkspaceSceneDiff,
+    WorkspaceSnapshot, WorkspaceTransaction, WorkspaceTransactionCommit,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliExitCode {
@@ -77,6 +83,37 @@ enum Command {
         overwrite: bool,
         format: OutputFormat,
     },
+    TxApply {
+        workspace: PathBuf,
+        file: PathBuf,
+        format: OutputFormat,
+    },
+    TxDryRun {
+        workspace: PathBuf,
+        file: PathBuf,
+        format: OutputFormat,
+    },
+    History {
+        workspace: PathBuf,
+        actor: Option<TransactionActor>,
+        node: Option<NodeId>,
+        parameter: Option<ParamId>,
+        format: OutputFormat,
+    },
+    SnapshotCreate {
+        workspace: PathBuf,
+        name: String,
+        format: OutputFormat,
+    },
+    SnapshotList {
+        workspace: PathBuf,
+        format: OutputFormat,
+    },
+    SnapshotRestore {
+        workspace: PathBuf,
+        snapshot_id: SnapshotId,
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +165,142 @@ struct CliError {
     message: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TransactionExecutionRecord {
+    mode: &'static str,
+    commit: WorkspaceTransactionCommit,
+    diff: Option<WorkspaceSceneDiff>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransactionRequestFile {
+    #[serde(default)]
+    actor: Option<TransactionActorRequest>,
+    #[serde(default)]
+    intent: Option<String>,
+    operations: Vec<WorkspaceOpRequest>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransactionActorRequest {
+    User,
+    Ai,
+    CliAutomation,
+    SystemMigration,
+}
+
+impl TransactionActorRequest {
+    const fn into_actor(self) -> TransactionActor {
+        match self {
+            Self::User => TransactionActor::User,
+            Self::Ai => TransactionActor::Ai,
+            Self::CliAutomation => TransactionActor::CliAutomation,
+            Self::SystemMigration => TransactionActor::SystemMigration,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorkspaceOpRequest {
+    ReplaceScene {
+        scene_source: String,
+    },
+    AddNode {
+        node_id: String,
+        draft: SceneNodeDraftRequest,
+    },
+    ReplaceNode {
+        node_id: String,
+        scene_source: String,
+    },
+    DeleteNode {
+        node_id: String,
+    },
+    RenameNode {
+        from: String,
+        to: String,
+    },
+    DuplicateNode {
+        source_node: String,
+        duplicate: String,
+    },
+    SetNodeLabel {
+        node_id: String,
+        label: Option<String>,
+    },
+    SetCompositionChildren {
+        node_id: String,
+        children: Vec<String>,
+    },
+    SetParameterScalar {
+        parameter_id: String,
+        value: f64,
+    },
+    SetTransformComponent {
+        node_id: String,
+        property: TransformPropertyRequest,
+        axis: AxisRequest,
+        value: f64,
+    },
+    SetPrimitiveScalar {
+        node_id: String,
+        field: PrimitiveScalarFieldRequest,
+        value: f64,
+    },
+    SetRootNode {
+        node_id: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SceneNodeDraftRequest {
+    Box,
+    Sphere,
+    Cylinder,
+    Capsule,
+    Plane,
+    Profile,
+    Union { children: Vec<String> },
+    Difference { children: Vec<String> },
+    Intersection { children: Vec<String> },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransformPropertyRequest {
+    Translation,
+    RotationDeg,
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum AxisRequest {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrimitiveScalarFieldRequest {
+    BoxX,
+    BoxY,
+    BoxZ,
+    SphereRadius,
+    CylinderRadius,
+    CylinderHeight,
+    CapsuleRadius,
+    CapsuleHeight,
+    PlaneWidth,
+    PlaneDepth,
+    ProfileWidth,
+    ProfileHeight,
+}
+
 impl CliError {
     fn new(exit_code: CliExitCode, message: impl Into<String>) -> Self {
         Self {
@@ -153,12 +326,26 @@ where
         return Err(usage(&program));
     };
 
+    if command_name == "tx" {
+        return parse_tx_command(&collected, &program);
+    }
+
+    if command_name == "snapshot" {
+        return parse_snapshot_command(&collected, &program);
+    }
+
     let mut output_format = OutputFormat::Text;
     let mut workspace: Option<PathBuf> = None;
     let mut requested_output: Option<NodeId> = None;
     let mut destination: Option<PathBuf> = None;
     let mut mesh_format = MeshExportFormat::Obj;
     let mut overwrite = false;
+    let mut file: Option<PathBuf> = None;
+    let mut actor_filter: Option<TransactionActor> = None;
+    let mut parameter_filter: Option<ParamId> = None;
+    let mut node_filter: Option<NodeId> = None;
+    let mut snapshot_name: Option<String> = None;
+    let mut snapshot_id: Option<SnapshotId> = None;
     let mut index = 2usize;
 
     while index < collected.len() {
@@ -211,6 +398,61 @@ where
             "--overwrite" => {
                 overwrite = true;
                 index += 1;
+            }
+            "--file" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--file`\n\n{}", usage(&program)));
+                };
+                file = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--actor" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!(
+                        "missing value for `--actor`\n\n{}",
+                        usage(&program)
+                    ));
+                };
+                let raw = value.to_string_lossy();
+                actor_filter = Some(
+                    parse_actor_flag(raw.as_ref())
+                        .map_err(|error| format!("{error}\n\n{}", usage(&program)))?,
+                );
+                index += 2;
+            }
+            "--node" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--node`\n\n{}", usage(&program)));
+                };
+                let raw = value.to_string_lossy();
+                node_filter = Some(parse_node_id(raw.as_ref(), "--node", &program)?);
+                index += 2;
+            }
+            "--parameter" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!(
+                        "missing value for `--parameter`\n\n{}",
+                        usage(&program)
+                    ));
+                };
+                let raw = value.to_string_lossy();
+                parameter_filter = Some(parse_param_id(raw.as_ref(), "--parameter", &program)?);
+                index += 2;
+            }
+            "--name" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--name`\n\n{}", usage(&program)));
+                };
+                snapshot_name = Some(value.to_string_lossy().into_owned());
+                index += 2;
+            }
+            "--id" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--id`\n\n{}", usage(&program)));
+                };
+                let raw = value.to_string_lossy();
+                snapshot_id = Some(parse_snapshot_id(raw.as_ref(), &program)?);
+                index += 2;
             }
             value if value.starts_with("--") => {
                 return Err(format!("unknown flag `{value}`\n\n{}", usage(&program)));
@@ -274,6 +516,177 @@ where
             overwrite,
             format: output_format,
         }),
+        "history" => {
+            if requested_output.is_some()
+                || destination.is_some()
+                || file.is_some()
+                || snapshot_name.is_some()
+                || snapshot_id.is_some()
+            {
+                return Err(format!(
+                    "`history` received unsupported flags\n\n{}",
+                    usage(&program)
+                ));
+            }
+            Ok(Command::History {
+                workspace,
+                actor: actor_filter,
+                node: node_filter,
+                parameter: parameter_filter,
+                format: output_format,
+            })
+        }
+        "tx" => {
+            let Some(mode) = collected
+                .get(2)
+                .map(|value| value.to_string_lossy().into_owned())
+            else {
+                return Err(format!("missing transaction mode\n\n{}", usage(&program)));
+            };
+            let workspace = collected.get(3).map(PathBuf::from).ok_or_else(|| {
+                format!(
+                    "missing workspace path for `tx {mode}`\n\n{}",
+                    usage(&program)
+                )
+            })?;
+            let mut tx_file: Option<PathBuf> = None;
+            let mut tx_format = OutputFormat::Text;
+            let mut tx_index = 4usize;
+            while tx_index < collected.len() {
+                let current = &collected[tx_index];
+                let flag = current.to_string_lossy();
+                match flag.as_ref() {
+                    "--json" => {
+                        tx_format = OutputFormat::Json;
+                        tx_index += 1;
+                    }
+                    "--file" => {
+                        let Some(value) = collected.get(tx_index + 1) else {
+                            return Err(format!(
+                                "missing value for `--file`\n\n{}",
+                                usage(&program)
+                            ));
+                        };
+                        tx_file = Some(PathBuf::from(value));
+                        tx_index += 2;
+                    }
+                    value if value.starts_with("--") => {
+                        return Err(format!("unknown flag `{value}`\n\n{}", usage(&program)));
+                    }
+                    other => {
+                        return Err(format!(
+                            "unexpected extra positional argument `{}`\n\n{}",
+                            other,
+                            usage(&program)
+                        ));
+                    }
+                }
+            }
+            let file = tx_file.ok_or_else(|| {
+                format!("missing `--file` for `tx {mode}`\n\n{}", usage(&program))
+            })?;
+            match mode.as_str() {
+                "apply" => Ok(Command::TxApply {
+                    workspace,
+                    file,
+                    format: tx_format,
+                }),
+                "dry-run" => Ok(Command::TxDryRun {
+                    workspace,
+                    file,
+                    format: tx_format,
+                }),
+                _ => Err(format!(
+                    "unknown transaction mode `{mode}`\n\n{}",
+                    usage(&program)
+                )),
+            }
+        }
+        "snapshot" => {
+            let Some(mode) = collected
+                .get(2)
+                .map(|value| value.to_string_lossy().into_owned())
+            else {
+                return Err(format!("missing snapshot mode\n\n{}", usage(&program)));
+            };
+            let workspace = collected.get(3).map(PathBuf::from).ok_or_else(|| {
+                format!(
+                    "missing workspace path for `snapshot {mode}`\n\n{}",
+                    usage(&program)
+                )
+            })?;
+            let mut snap_name: Option<String> = None;
+            let mut snap_id: Option<SnapshotId> = None;
+            let mut snap_format = OutputFormat::Text;
+            let mut snap_index = 4usize;
+            while snap_index < collected.len() {
+                let current = &collected[snap_index];
+                let flag = current.to_string_lossy();
+                match flag.as_ref() {
+                    "--json" => {
+                        snap_format = OutputFormat::Json;
+                        snap_index += 1;
+                    }
+                    "--name" => {
+                        let Some(value) = collected.get(snap_index + 1) else {
+                            return Err(format!(
+                                "missing value for `--name`\n\n{}",
+                                usage(&program)
+                            ));
+                        };
+                        snap_name = Some(value.to_string_lossy().into_owned());
+                        snap_index += 2;
+                    }
+                    "--id" => {
+                        let Some(value) = collected.get(snap_index + 1) else {
+                            return Err(format!("missing value for `--id`\n\n{}", usage(&program)));
+                        };
+                        snap_id = Some(parse_snapshot_id(&value.to_string_lossy(), &program)?);
+                        snap_index += 2;
+                    }
+                    value if value.starts_with("--") => {
+                        return Err(format!("unknown flag `{value}`\n\n{}", usage(&program)));
+                    }
+                    other => {
+                        return Err(format!(
+                            "unexpected extra positional argument `{}`\n\n{}",
+                            other,
+                            usage(&program)
+                        ));
+                    }
+                }
+            }
+            match mode.as_str() {
+                "create" => Ok(Command::SnapshotCreate {
+                    workspace,
+                    name: snap_name.ok_or_else(|| {
+                        format!(
+                            "missing `--name` for `snapshot create`\n\n{}",
+                            usage(&program)
+                        )
+                    })?,
+                    format: snap_format,
+                }),
+                "list" => Ok(Command::SnapshotList {
+                    workspace,
+                    format: snap_format,
+                }),
+                "restore" => Ok(Command::SnapshotRestore {
+                    workspace,
+                    snapshot_id: snap_id.ok_or_else(|| {
+                        format!(
+                            "missing `--id` for `snapshot restore`\n\n{}",
+                            usage(&program)
+                        )
+                    })?,
+                    format: snap_format,
+                }),
+                _ => Err(format!(
+                    "unknown snapshot mode `{mode}`\n\n{}",
+                    usage(&program)
+                )),
+            }
+        }
         _ => Err(format!(
             "unknown command `{command_name}`\n\n{}",
             usage(&program)
@@ -281,9 +694,155 @@ where
     }
 }
 
+fn parse_tx_command(collected: &[OsString], program: &str) -> Result<Command, String> {
+    let Some(mode) = collected
+        .get(2)
+        .map(|value| value.to_string_lossy().into_owned())
+    else {
+        return Err(format!("missing transaction mode\n\n{}", usage(program)));
+    };
+    let workspace = collected.get(3).map(PathBuf::from).ok_or_else(|| {
+        format!(
+            "missing workspace path for `tx {mode}`\n\n{}",
+            usage(program)
+        )
+    })?;
+    let mut tx_file: Option<PathBuf> = None;
+    let mut tx_format = OutputFormat::Text;
+    let mut index = 4usize;
+    while index < collected.len() {
+        let current = &collected[index];
+        let flag = current.to_string_lossy();
+        match flag.as_ref() {
+            "--json" => {
+                tx_format = OutputFormat::Json;
+                index += 1;
+            }
+            "--file" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--file`\n\n{}", usage(program)));
+                };
+                tx_file = Some(PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("unknown flag `{value}`\n\n{}", usage(program)));
+            }
+            other => {
+                return Err(format!(
+                    "unexpected extra positional argument `{}`\n\n{}",
+                    other,
+                    usage(program)
+                ));
+            }
+        }
+    }
+    let file =
+        tx_file.ok_or_else(|| format!("missing `--file` for `tx {mode}`\n\n{}", usage(program)))?;
+    match mode.as_str() {
+        "apply" => Ok(Command::TxApply {
+            workspace,
+            file,
+            format: tx_format,
+        }),
+        "dry-run" => Ok(Command::TxDryRun {
+            workspace,
+            file,
+            format: tx_format,
+        }),
+        _ => Err(format!(
+            "unknown transaction mode `{mode}`\n\n{}",
+            usage(program)
+        )),
+    }
+}
+
+fn parse_snapshot_command(collected: &[OsString], program: &str) -> Result<Command, String> {
+    let Some(mode) = collected
+        .get(2)
+        .map(|value| value.to_string_lossy().into_owned())
+    else {
+        return Err(format!("missing snapshot mode\n\n{}", usage(program)));
+    };
+    let workspace = collected.get(3).map(PathBuf::from).ok_or_else(|| {
+        format!(
+            "missing workspace path for `snapshot {mode}`\n\n{}",
+            usage(program)
+        )
+    })?;
+    let mut snap_name: Option<String> = None;
+    let mut snap_id: Option<SnapshotId> = None;
+    let mut snap_format = OutputFormat::Text;
+    let mut index = 4usize;
+    while index < collected.len() {
+        let current = &collected[index];
+        let flag = current.to_string_lossy();
+        match flag.as_ref() {
+            "--json" => {
+                snap_format = OutputFormat::Json;
+                index += 1;
+            }
+            "--name" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--name`\n\n{}", usage(program)));
+                };
+                snap_name = Some(value.to_string_lossy().into_owned());
+                index += 2;
+            }
+            "--id" => {
+                let Some(value) = collected.get(index + 1) else {
+                    return Err(format!("missing value for `--id`\n\n{}", usage(program)));
+                };
+                snap_id = Some(parse_snapshot_id(&value.to_string_lossy(), program)?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("unknown flag `{value}`\n\n{}", usage(program)));
+            }
+            other => {
+                return Err(format!(
+                    "unexpected extra positional argument `{}`\n\n{}",
+                    other,
+                    usage(program)
+                ));
+            }
+        }
+    }
+    match mode.as_str() {
+        "create" => Ok(Command::SnapshotCreate {
+            workspace,
+            name: snap_name.ok_or_else(|| {
+                format!(
+                    "missing `--name` for `snapshot create`\n\n{}",
+                    usage(program)
+                )
+            })?,
+            format: snap_format,
+        }),
+        "list" => Ok(Command::SnapshotList {
+            workspace,
+            format: snap_format,
+        }),
+        "restore" => Ok(Command::SnapshotRestore {
+            workspace,
+            snapshot_id: snap_id.ok_or_else(|| {
+                format!(
+                    "missing `--id` for `snapshot restore`\n\n{}",
+                    usage(program)
+                )
+            })?,
+            format: snap_format,
+        }),
+        _ => Err(format!(
+            "unknown snapshot mode `{mode}`\n\n{}",
+            usage(program)
+        )),
+    }
+}
+
 fn usage(program: &str) -> String {
     format!(
-        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj] [--destination <relative-path>] [--overwrite] [--json]"
+        "Usage:\n  {program} validate <workspace> [--json]\n  {program} inspect <workspace> [--json]\n  {program} eval <workspace> [--output <node-id>] [--json]\n  {program} export <workspace> [--output <node-id>] [--format obj] [--destination <relative-path>] [--overwrite] [--json]\n  {program} tx apply <workspace> --file <transaction.json> [--json]\n  {program} tx dry-run <workspace> --file <transaction.json> [--json]\n  {program} history <workspace> [--actor <actor>] [--node <node-id>] [--parameter <param-id>] [--json]\n  {program} snapshot create <workspace> --name <snapshot-name> [--json]\n  {program} snapshot list <workspace> [--json]\n  {program} snapshot restore <workspace> --id <snapshot-id> [--json]"
     )
 }
 
@@ -368,7 +927,567 @@ fn execute_command(command: Command) -> Result<String, CliError> {
                 }),
             )
         }
+        Command::TxApply {
+            workspace,
+            file,
+            format,
+        } => {
+            let mut workspace = open_workspace(&workspace)?;
+            let transaction = load_transaction_file(&file)?;
+            let record = execute_transaction_apply(&mut workspace, &transaction)?;
+            render_output(
+                format,
+                render_transaction_text(&workspace, &record),
+                json!({
+                    "command": "tx_apply",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "transaction": transaction_execution_json(&record),
+                }),
+            )
+        }
+        Command::TxDryRun {
+            workspace,
+            file,
+            format,
+        } => {
+            let workspace = open_workspace(&workspace)?;
+            let transaction = load_transaction_file(&file)?;
+            let record = execute_transaction_dry_run(&workspace, &transaction)?;
+            render_output(
+                format,
+                render_transaction_text(&workspace, &record),
+                json!({
+                    "command": "tx_dry_run",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "transaction": transaction_execution_json(&record),
+                }),
+            )
+        }
+        Command::History {
+            workspace,
+            actor,
+            node,
+            parameter,
+            format,
+        } => {
+            let workspace = open_workspace(&workspace)?;
+            let entries = read_history(&workspace, actor, node, parameter)?;
+            render_output(
+                format,
+                render_history_text(&workspace, &entries),
+                json!({
+                    "command": "history",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "history": history_entries_json(&entries),
+                }),
+            )
+        }
+        Command::SnapshotCreate {
+            workspace,
+            name,
+            format,
+        } => {
+            let workspace = open_workspace(&workspace)?;
+            let snapshot = workspace
+                .create_snapshot(&name, TransactionActor::CliAutomation)
+                .map_err(|error| {
+                    CliError::new(
+                        CliExitCode::Io,
+                        format!("snapshot creation failed: {error}"),
+                    )
+                })?;
+            render_output(
+                format,
+                render_snapshot_create_text(&workspace, &snapshot),
+                json!({
+                    "command": "snapshot_create",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "snapshot": snapshot_json(&snapshot),
+                }),
+            )
+        }
+        Command::SnapshotList { workspace, format } => {
+            let workspace = open_workspace(&workspace)?;
+            let snapshots = workspace.snapshots().map_err(|error| {
+                CliError::new(CliExitCode::Io, format!("snapshot listing failed: {error}"))
+            })?;
+            render_output(
+                format,
+                render_snapshot_list_text(&workspace, &snapshots),
+                json!({
+                    "command": "snapshot_list",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "snapshots": snapshots.iter().map(snapshot_json).collect::<Vec<_>>(),
+                }),
+            )
+        }
+        Command::SnapshotRestore {
+            workspace,
+            snapshot_id,
+            format,
+        } => {
+            let mut workspace = open_workspace(&workspace)?;
+            let record = execute_snapshot_restore(&mut workspace, &snapshot_id)?;
+            render_output(
+                format,
+                render_transaction_text(&workspace, &record),
+                json!({
+                    "command": "snapshot_restore",
+                    "status": "ok",
+                    "workspace": workspace_json(&workspace),
+                    "transaction": transaction_execution_json(&record),
+                }),
+            )
+        }
     }
+}
+
+fn parse_actor_flag(raw: &str) -> Result<TransactionActor, String> {
+    match raw {
+        "user" => Ok(TransactionActor::User),
+        "ai" => Ok(TransactionActor::Ai),
+        "cli-automation" => Ok(TransactionActor::CliAutomation),
+        "system-migration" => Ok(TransactionActor::SystemMigration),
+        _ => Err(format!(
+            "unsupported actor `{raw}`; supported actors: user, ai, cli-automation, system-migration"
+        )),
+    }
+}
+
+fn parse_node_id(raw: &str, flag: &str, program: &str) -> Result<NodeId, String> {
+    NodeId::new(raw).map_err(|error| {
+        format!(
+            "invalid node ID for `{flag}`: {error}\n\n{}",
+            usage(program)
+        )
+    })
+}
+
+fn parse_param_id(raw: &str, flag: &str, program: &str) -> Result<ParamId, String> {
+    ParamId::new(raw).map_err(|error| {
+        format!(
+            "invalid parameter ID for `{flag}`: {error}\n\n{}",
+            usage(program)
+        )
+    })
+}
+
+fn parse_snapshot_id(raw: &str, program: &str) -> Result<SnapshotId, String> {
+    serde_json::from_value::<SnapshotId>(Value::String(raw.to_owned()))
+        .map_err(|error| format!("invalid snapshot ID `{raw}`: {error}\n\n{}", usage(program)))
+}
+
+fn load_transaction_file(path: &Path) -> Result<WorkspaceTransaction, CliError> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        CliError::new(
+            CliExitCode::Io,
+            format!(
+                "failed to read transaction file `{}`: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let request: TransactionRequestFile = serde_json::from_str(&text).map_err(|error| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!(
+                "failed to parse transaction file `{}` as JSON: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let actor = request
+        .actor
+        .unwrap_or(TransactionActorRequest::CliAutomation)
+        .into_actor();
+    let operations = request
+        .operations
+        .into_iter()
+        .map(WorkspaceOpRequest::into_workspace_op)
+        .collect::<Result<Vec<_>, _>>()?;
+    WorkspaceTransaction::new(actor, request.intent, operations).map_err(|error| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!("transaction file `{}` is invalid: {error}", path.display()),
+        )
+    })
+}
+
+impl WorkspaceOpRequest {
+    fn into_workspace_op(self) -> Result<WorkspaceOp, CliError> {
+        match self {
+            Self::ReplaceScene { scene_source } => {
+                let scene = parse_scene(&scene_source).map_err(|error| {
+                    CliError::new(
+                        CliExitCode::Usage,
+                        format!("replace_scene scene_source is invalid: {error}"),
+                    )
+                })?;
+                Ok(WorkspaceOp::ReplaceScene {
+                    id: OperationId::new(),
+                    scene: Box::new(scene),
+                })
+            }
+            Self::AddNode { node_id, draft } => Ok(WorkspaceOp::AddNode {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "add_node.node_id")?,
+                draft: draft.into_scene_node_draft()?,
+            }),
+            Self::ReplaceNode {
+                node_id,
+                scene_source,
+            } => Ok(WorkspaceOp::ReplaceNode {
+                id: OperationId::new(),
+                node: Box::new(extract_node_from_scene_source(
+                    &scene_source,
+                    &node_id,
+                    "replace_node.scene_source",
+                )?),
+            }),
+            Self::DeleteNode { node_id } => Ok(WorkspaceOp::DeleteNode {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "delete_node.node_id")?,
+            }),
+            Self::RenameNode { from, to } => Ok(WorkspaceOp::RenameNode {
+                id: OperationId::new(),
+                from: parse_workspace_node_id(&from, "rename_node.from")?,
+                to: parse_workspace_node_id(&to, "rename_node.to")?,
+            }),
+            Self::DuplicateNode {
+                source_node,
+                duplicate,
+            } => Ok(WorkspaceOp::DuplicateNode {
+                id: OperationId::new(),
+                source_node: parse_workspace_node_id(&source_node, "duplicate_node.source_node")?,
+                duplicate: parse_workspace_node_id(&duplicate, "duplicate_node.duplicate")?,
+            }),
+            Self::SetNodeLabel { node_id, label } => Ok(WorkspaceOp::SetNodeLabel {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "set_node_label.node_id")?,
+                label,
+            }),
+            Self::SetCompositionChildren { node_id, children } => {
+                Ok(WorkspaceOp::SetCompositionChildren {
+                    id: OperationId::new(),
+                    node_id: parse_workspace_node_id(&node_id, "set_composition_children.node_id")?,
+                    children: children
+                        .into_iter()
+                        .map(|child| {
+                            parse_workspace_node_id(&child, "set_composition_children.children")
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                })
+            }
+            Self::SetParameterScalar {
+                parameter_id,
+                value,
+            } => Ok(WorkspaceOp::SetParameterScalar {
+                id: OperationId::new(),
+                parameter_id: parse_workspace_param_id(
+                    &parameter_id,
+                    "set_parameter_scalar.parameter_id",
+                )?,
+                value,
+            }),
+            Self::SetTransformComponent {
+                node_id,
+                property,
+                axis,
+                value,
+            } => Ok(WorkspaceOp::SetTransformComponent {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "set_transform_component.node_id")?,
+                property: property.into_transform_property(),
+                axis: axis.into_axis(),
+                value,
+            }),
+            Self::SetPrimitiveScalar {
+                node_id,
+                field,
+                value,
+            } => Ok(WorkspaceOp::SetPrimitiveScalar {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "set_primitive_scalar.node_id")?,
+                field: field.into_primitive_scalar_field(),
+                value,
+            }),
+            Self::SetRootNode { node_id } => Ok(WorkspaceOp::SetRootNode {
+                id: OperationId::new(),
+                node_id: parse_workspace_node_id(&node_id, "set_root_node.node_id")?,
+            }),
+        }
+    }
+}
+
+impl SceneNodeDraftRequest {
+    fn into_scene_node_draft(self) -> Result<geom_scene::SceneNodeDraft, CliError> {
+        Ok(match self {
+            Self::Box => geom_scene::SceneNodeDraft::Box,
+            Self::Sphere => geom_scene::SceneNodeDraft::Sphere,
+            Self::Cylinder => geom_scene::SceneNodeDraft::Cylinder,
+            Self::Capsule => geom_scene::SceneNodeDraft::Capsule,
+            Self::Plane => geom_scene::SceneNodeDraft::Plane,
+            Self::Profile => geom_scene::SceneNodeDraft::Profile,
+            Self::Union { children } => geom_scene::SceneNodeDraft::Union {
+                children: children
+                    .into_iter()
+                    .map(|child| parse_workspace_node_id(&child, "scene_node_draft.union.children"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            Self::Difference { children } => geom_scene::SceneNodeDraft::Difference {
+                children: children
+                    .into_iter()
+                    .map(|child| {
+                        parse_workspace_node_id(&child, "scene_node_draft.difference.children")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            Self::Intersection { children } => geom_scene::SceneNodeDraft::Intersection {
+                children: children
+                    .into_iter()
+                    .map(|child| {
+                        parse_workspace_node_id(&child, "scene_node_draft.intersection.children")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        })
+    }
+}
+
+impl TransformPropertyRequest {
+    const fn into_transform_property(self) -> geom_scene::TransformProperty {
+        match self {
+            Self::Translation => geom_scene::TransformProperty::Translation,
+            Self::RotationDeg => geom_scene::TransformProperty::RotationDegrees,
+            Self::Scale => geom_scene::TransformProperty::Scale,
+        }
+    }
+}
+
+impl AxisRequest {
+    const fn into_axis(self) -> geom_scene::Axis {
+        match self {
+            Self::X => geom_scene::Axis::X,
+            Self::Y => geom_scene::Axis::Y,
+            Self::Z => geom_scene::Axis::Z,
+        }
+    }
+}
+
+impl PrimitiveScalarFieldRequest {
+    const fn into_primitive_scalar_field(self) -> geom_scene::PrimitiveScalarField {
+        match self {
+            Self::BoxX => geom_scene::PrimitiveScalarField::BoxX,
+            Self::BoxY => geom_scene::PrimitiveScalarField::BoxY,
+            Self::BoxZ => geom_scene::PrimitiveScalarField::BoxZ,
+            Self::SphereRadius => geom_scene::PrimitiveScalarField::SphereRadius,
+            Self::CylinderRadius => geom_scene::PrimitiveScalarField::CylinderRadius,
+            Self::CylinderHeight => geom_scene::PrimitiveScalarField::CylinderHeight,
+            Self::CapsuleRadius => geom_scene::PrimitiveScalarField::CapsuleRadius,
+            Self::CapsuleHeight => geom_scene::PrimitiveScalarField::CapsuleHeight,
+            Self::PlaneWidth => geom_scene::PrimitiveScalarField::PlaneWidth,
+            Self::PlaneDepth => geom_scene::PrimitiveScalarField::PlaneDepth,
+            Self::ProfileWidth => geom_scene::PrimitiveScalarField::ProfileWidth,
+            Self::ProfileHeight => geom_scene::PrimitiveScalarField::ProfileHeight,
+        }
+    }
+}
+
+fn parse_workspace_node_id(raw: &str, field: &str) -> Result<NodeId, CliError> {
+    NodeId::new(raw).map_err(|error| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!("invalid node ID for `{field}`: {error}"),
+        )
+    })
+}
+
+fn parse_workspace_param_id(raw: &str, field: &str) -> Result<ParamId, CliError> {
+    ParamId::new(raw).map_err(|error| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!("invalid parameter ID for `{field}`: {error}"),
+        )
+    })
+}
+
+fn extract_node_from_scene_source(
+    scene_source: &str,
+    node_id: &str,
+    field: &str,
+) -> Result<Node, CliError> {
+    let scene = parse_scene(scene_source).map_err(|error| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!("invalid scene source for `{field}`: {error}"),
+        )
+    })?;
+    let node_id = parse_workspace_node_id(node_id, "replace_node.node_id")?;
+    scene.nodes().get(&node_id).cloned().ok_or_else(|| {
+        CliError::new(
+            CliExitCode::Usage,
+            format!("scene source for `{field}` does not contain node `{node_id}`"),
+        )
+    })
+}
+
+fn execute_transaction_apply(
+    workspace: &mut Workspace,
+    transaction: &WorkspaceTransaction,
+) -> Result<TransactionExecutionRecord, CliError> {
+    let commit = workspace.apply_transaction(transaction).map_err(|error| {
+        CliError::new(
+            CliExitCode::Source,
+            format!("transaction apply failed: {error}"),
+        )
+    })?;
+    let diff = workspace
+        .transaction_diff(commit.transaction_id())
+        .map_err(|error| {
+            CliError::new(
+                CliExitCode::Io,
+                format!("failed to read transaction diff: {error}"),
+            )
+        })?;
+    Ok(TransactionExecutionRecord {
+        mode: "apply",
+        commit,
+        diff,
+    })
+}
+
+fn execute_transaction_dry_run(
+    workspace: &Workspace,
+    transaction: &WorkspaceTransaction,
+) -> Result<TransactionExecutionRecord, CliError> {
+    let temp_root = clone_workspace_to_temp(workspace.root())?;
+    let mut temp_workspace = open_workspace(&temp_root)?;
+    let result = execute_transaction_apply(&mut temp_workspace, transaction);
+    let _ = fs::remove_dir_all(&temp_root);
+    let mut record = result?;
+    record.mode = "dry-run";
+    Ok(record)
+}
+
+fn execute_snapshot_restore(
+    workspace: &mut Workspace,
+    snapshot_id: &SnapshotId,
+) -> Result<TransactionExecutionRecord, CliError> {
+    let commit = workspace
+        .restore_snapshot(snapshot_id, TransactionActor::CliAutomation)
+        .map_err(|error| {
+            CliError::new(
+                CliExitCode::Source,
+                format!("snapshot restore failed: {error}"),
+            )
+        })?;
+    let diff = workspace
+        .transaction_diff(commit.transaction_id())
+        .map_err(|error| {
+            CliError::new(
+                CliExitCode::Io,
+                format!("failed to read transaction diff: {error}"),
+            )
+        })?;
+    Ok(TransactionExecutionRecord {
+        mode: "snapshot-restore",
+        commit,
+        diff,
+    })
+}
+
+fn clone_workspace_to_temp(source_root: &Path) -> Result<PathBuf, CliError> {
+    let temp_root = std::env::temp_dir().join(format!(
+        "morphos-cli-dry-run-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    copy_directory_recursive(source_root, &temp_root)?;
+    Ok(temp_root)
+}
+
+fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(target).map_err(|error| {
+        CliError::new(
+            CliExitCode::Io,
+            format!("failed to create directory `{}`: {error}", target.display()),
+        )
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| {
+        CliError::new(
+            CliExitCode::Io,
+            format!("failed to read directory `{}`: {error}", source.display()),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            CliError::new(
+                CliExitCode::Io,
+                format!("failed to read entry under `{}`: {error}", source.display()),
+            )
+        })?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| {
+                CliError::new(
+                    CliExitCode::Io,
+                    format!("failed to inspect `{}`: {error}", source_path.display()),
+                )
+            })?
+            .is_dir()
+        {
+            copy_directory_recursive(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).map_err(|error| {
+                CliError::new(
+                    CliExitCode::Io,
+                    format!(
+                        "failed to copy `{}` to `{}`: {error}",
+                        source_path.display(),
+                        target_path.display()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_history(
+    workspace: &Workspace,
+    actor: Option<TransactionActor>,
+    node: Option<NodeId>,
+    parameter: Option<ParamId>,
+) -> Result<Vec<WorkspaceHistoryEntry>, CliError> {
+    let entries = if actor.is_none() && node.is_none() && parameter.is_none() {
+        workspace.history_entries().map_err(|error| {
+            CliError::new(CliExitCode::Io, format!("history query failed: {error}"))
+        })?
+    } else {
+        let mut query = HistoryQuery::default();
+        if let Some(actor) = actor {
+            query = query.with_actor(actor);
+        }
+        if let Some(node) = node {
+            query = query.with_node(node);
+        }
+        if let Some(parameter) = parameter {
+            query = query.with_parameter(parameter);
+        }
+        workspace.query_history(&query).map_err(|error| {
+            CliError::new(CliExitCode::Io, format!("history query failed: {error}"))
+        })?
+    };
+    Ok(entries)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,6 +1810,94 @@ fn render_export_text(
     output
 }
 
+fn render_transaction_text(workspace: &Workspace, record: &TransactionExecutionRecord) -> String {
+    let mut output = String::new();
+    let _ = writeln!(&mut output, "Workspace: {}", workspace.summary().name());
+    let _ = writeln!(&mut output, "Path: {}", workspace.root().display());
+    let _ = writeln!(&mut output, "Mode: {}", record.mode);
+    let _ = writeln!(
+        &mut output,
+        "Transaction ID: {}",
+        record.commit.transaction_id()
+    );
+    let _ = writeln!(&mut output, "Actor: {}", actor_label(record.commit.actor()));
+    let _ = writeln!(
+        &mut output,
+        "Intent: {}",
+        record.commit.intent().unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        &mut output,
+        "Revision: {} -> {}",
+        record.commit.revision_before(),
+        record.commit.revision_after()
+    );
+    let _ = writeln!(
+        &mut output,
+        "Affected nodes: {}",
+        join_node_ids(record.commit.affected_targets().node_ids().iter())
+    );
+    let _ = writeln!(
+        &mut output,
+        "Affected parameters: {}",
+        join_param_ids(record.commit.affected_targets().parameter_ids().iter())
+    );
+    if let Some(diff) = &record.diff {
+        let _ = writeln!(&mut output, "Diff summary: {}", diff.summary());
+        let _ = write!(&mut output, "Diff changes: {}", render_diff_changes(diff));
+    }
+    output
+}
+
+fn render_history_text(workspace: &Workspace, entries: &[WorkspaceHistoryEntry]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(&mut output, "Workspace: {}", workspace.summary().name());
+    let _ = writeln!(&mut output, "Path: {}", workspace.root().display());
+    let _ = writeln!(&mut output, "Entries: {}", entries.len());
+    for entry in entries {
+        let _ = writeln!(
+            &mut output,
+            "- rev {} -> {} | {} | {} | {}",
+            entry.revision_before(),
+            entry.revision_after(),
+            actor_label(entry.actor()),
+            entry.transaction_id(),
+            entry.intent().unwrap_or("(no intent)")
+        );
+    }
+    output
+}
+
+fn render_snapshot_create_text(workspace: &Workspace, snapshot: &WorkspaceSnapshot) -> String {
+    format!(
+        "Workspace: {}\nPath: {}\nCreated snapshot: {}\nSnapshot ID: {}\nActor: {}\nCreated from revision: {}",
+        workspace.summary().name(),
+        workspace.root().display(),
+        snapshot.name(),
+        snapshot.id(),
+        actor_label(snapshot.actor()),
+        snapshot.created_from_revision()
+    )
+}
+
+fn render_snapshot_list_text(workspace: &Workspace, snapshots: &[WorkspaceSnapshot]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(&mut output, "Workspace: {}", workspace.summary().name());
+    let _ = writeln!(&mut output, "Path: {}", workspace.root().display());
+    let _ = writeln!(&mut output, "Snapshots: {}", snapshots.len());
+    for snapshot in snapshots {
+        let _ = writeln!(
+            &mut output,
+            "- {} | {} | {} | rev {}",
+            snapshot.id(),
+            snapshot.name(),
+            actor_label(snapshot.actor()),
+            snapshot.created_from_revision()
+        );
+    }
+    output
+}
+
 fn workspace_json(workspace: &Workspace) -> Value {
     let summary = workspace.summary();
     json!({
@@ -771,6 +1978,119 @@ fn export_record_json(export: &MeshExportRecord) -> Value {
     })
 }
 
+fn transaction_execution_json(record: &TransactionExecutionRecord) -> Value {
+    json!({
+        "mode": record.mode,
+        "transaction_id": record.commit.transaction_id().to_string(),
+        "actor": actor_label(record.commit.actor()),
+        "intent": record.commit.intent(),
+        "revision_before": record.commit.revision_before().get(),
+        "revision_after": record.commit.revision_after().get(),
+        "operation_ids": record.commit.operation_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "affected_targets": affected_targets_json(record.commit.affected_targets()),
+        "diff": record.diff.as_ref().map(diff_json).unwrap_or(Value::Null),
+    })
+}
+
+fn history_entries_json(entries: &[WorkspaceHistoryEntry]) -> Value {
+    Value::Array(entries.iter().map(history_entry_json).collect())
+}
+
+fn history_entry_json(entry: &WorkspaceHistoryEntry) -> Value {
+    json!({
+        "transaction_id": entry.transaction_id().to_string(),
+        "actor": actor_label(entry.actor()),
+        "intent": entry.intent(),
+        "timestamp_millis": entry.timestamp_millis(),
+        "revision_before": entry.revision_before().get(),
+        "revision_after": entry.revision_after().get(),
+        "affected_targets": affected_targets_json(entry.affected_targets()),
+        "operations": entry.operations().iter().map(|operation| {
+            json!({
+                "id": operation.id().to_string(),
+                "kind": operation.kind(),
+                "summary": operation.summary(),
+                "affected_targets": affected_targets_json(operation.affected_targets()),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn snapshot_json(snapshot: &WorkspaceSnapshot) -> Value {
+    json!({
+        "id": snapshot.id().to_string(),
+        "name": snapshot.name(),
+        "actor": actor_label(snapshot.actor()),
+        "created_from_revision": snapshot.created_from_revision().get(),
+        "created_at_millis": snapshot.created_at_millis(),
+    })
+}
+
+fn diff_json(diff: &WorkspaceSceneDiff) -> Value {
+    json!({
+        "before_revision": diff.before_revision().get(),
+        "after_revision": diff.after_revision().get(),
+        "summary": diff.summary(),
+        "affected_targets": affected_targets_json(diff.affected_targets()),
+        "changes": diff.changes().iter().map(scene_change_json).collect::<Vec<_>>(),
+    })
+}
+
+fn affected_targets_json(targets: &geom_workspace::AffectedTargets) -> Value {
+    json!({
+        "node_ids": targets.node_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "parameter_ids": targets.parameter_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+    })
+}
+
+fn scene_change_json(change: &WorkspaceSceneChange) -> Value {
+    match change {
+        WorkspaceSceneChange::RootChanged { before, after } => json!({
+            "kind": "root_changed",
+            "before": before.to_string(),
+            "after": after.to_string(),
+        }),
+        WorkspaceSceneChange::ParameterAdded { id, value } => json!({
+            "kind": "parameter_added",
+            "id": id.to_string(),
+            "value": value,
+        }),
+        WorkspaceSceneChange::ParameterRemoved { id, value } => json!({
+            "kind": "parameter_removed",
+            "id": id.to_string(),
+            "value": value,
+        }),
+        WorkspaceSceneChange::ParameterChanged { id, before, after } => json!({
+            "kind": "parameter_changed",
+            "id": id.to_string(),
+            "before": before,
+            "after": after,
+        }),
+        WorkspaceSceneChange::NodeAdded { id, kind } => json!({
+            "kind": "node_added",
+            "id": id.to_string(),
+            "node_kind": kind,
+        }),
+        WorkspaceSceneChange::NodeRemoved { id, kind } => json!({
+            "kind": "node_removed",
+            "id": id.to_string(),
+            "node_kind": kind,
+        }),
+        WorkspaceSceneChange::NodeChanged {
+            id,
+            before_kind,
+            after_kind,
+            fields,
+        } => json!({
+            "kind": "node_changed",
+            "id": id.to_string(),
+            "before_kind": before_kind,
+            "after_kind": after_kind,
+            "fields": fields.iter().map(node_change_field_label).collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn bounds_json(bounds: &Bounds) -> Value {
     match bounds {
         Bounds::Empty => json!({
@@ -798,6 +2118,69 @@ fn render_bounds_text(bounds: &Bounds) -> String {
             bounds.center(),
             bounds.size()
         ),
+    }
+}
+
+fn actor_label(actor: TransactionActor) -> &'static str {
+    match actor {
+        TransactionActor::User => "user",
+        TransactionActor::Ai => "ai",
+        TransactionActor::CliAutomation => "cli-automation",
+        TransactionActor::SystemMigration => "system-migration",
+    }
+}
+
+fn render_diff_changes(diff: &WorkspaceSceneDiff) -> String {
+    diff.changes()
+        .iter()
+        .map(|change| match change {
+            WorkspaceSceneChange::RootChanged { before, after } => {
+                format!("root {} -> {}", before, after)
+            }
+            WorkspaceSceneChange::ParameterAdded { id, value } => {
+                format!("parameter {} added={}", id, value)
+            }
+            WorkspaceSceneChange::ParameterRemoved { id, value } => {
+                format!("parameter {} removed={}", id, value)
+            }
+            WorkspaceSceneChange::ParameterChanged { id, before, after } => {
+                format!("parameter {} {} -> {}", id, before, after)
+            }
+            WorkspaceSceneChange::NodeAdded { id, kind } => {
+                format!("node {} added ({})", id, kind)
+            }
+            WorkspaceSceneChange::NodeRemoved { id, kind } => {
+                format!("node {} removed ({})", id, kind)
+            }
+            WorkspaceSceneChange::NodeChanged {
+                id,
+                before_kind,
+                after_kind,
+                fields,
+            } => format!(
+                "node {} {} -> {} [{}]",
+                id,
+                before_kind,
+                after_kind,
+                fields
+                    .iter()
+                    .map(node_change_field_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn node_change_field_label(field: &geom_workspace::NodeChangeField) -> &'static str {
+    match field {
+        geom_workspace::NodeChangeField::Label => "label",
+        geom_workspace::NodeChangeField::Kind => "kind",
+        geom_workspace::NodeChangeField::Transform => "transform",
+        geom_workspace::NodeChangeField::CompositionChildren => "composition_children",
+        geom_workspace::NodeChangeField::PrimitiveShape => "primitive_shape",
+        geom_workspace::NodeChangeField::Extensions => "extensions",
     }
 }
 
@@ -867,6 +2250,12 @@ mod tests {
                 fs::copy(&source_path, &target_path).expect("copy file");
             }
         }
+    }
+
+    fn write_transaction_file(workspace_root: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = workspace_root.join(name);
+        fs::write(&path, contents).expect("write transaction file");
+        path
     }
 
     #[test]
@@ -1075,5 +2464,185 @@ mod tests {
         .expect("second export");
 
         assert_eq!(first_text, second_text);
+    }
+
+    #[test]
+    fn tx_dry_run_reports_diff_without_mutating_workspace() {
+        let workspace_root = clone_workspace_fixture();
+        let request_path = write_transaction_file(
+            &workspace_root,
+            "set-param.json",
+            r#"{
+  "intent": "Dry run parameter change",
+  "operations": [
+    {
+      "kind": "set_parameter_scalar",
+      "parameter_id": "arm_length",
+      "value": 4.2
+    }
+  ]
+}"#,
+        );
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("tx"),
+            OsString::from("dry-run"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--file"),
+            request_path.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Success);
+        let parsed: Value = serde_json::from_str(&result.stdout).expect("json");
+        assert_eq!(parsed["transaction"]["mode"], "dry-run");
+        assert_eq!(
+            parsed["transaction"]["diff"]["summary"],
+            "0 root changes, 1 parameter changes, 0 nodes added, 0 nodes removed, 0 nodes changed"
+        );
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("scene");
+        assert_eq!(
+            reopened.parameters()[&ParamId::new("arm_length").expect("param")].scalar_value(),
+            2.6
+        );
+    }
+
+    #[test]
+    fn tx_apply_mutates_workspace_and_history() {
+        let workspace_root = clone_workspace_fixture();
+        let request_path = write_transaction_file(
+            &workspace_root,
+            "apply-param.json",
+            r#"{
+  "actor": "cli-automation",
+  "intent": "Apply parameter change",
+  "operations": [
+    {
+      "kind": "set_parameter_scalar",
+      "parameter_id": "arm_length",
+      "value": 4.8
+    }
+  ]
+}"#,
+        );
+
+        let result = run([
+            OsString::from("morphos"),
+            OsString::from("tx"),
+            OsString::from("apply"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--file"),
+            request_path.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(result.exit_code, CliExitCode::Success);
+        let parsed: Value = serde_json::from_str(&result.stdout).expect("json");
+        assert_eq!(parsed["transaction"]["mode"], "apply");
+        assert_eq!(parsed["transaction"]["actor"], "cli-automation");
+
+        let reopened = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("scene");
+        assert_eq!(
+            reopened.parameters()[&ParamId::new("arm_length").expect("param")].scalar_value(),
+            4.8
+        );
+
+        let history = run([
+            OsString::from("morphos"),
+            OsString::from("history"),
+            workspace_root.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(history.exit_code, CliExitCode::Success);
+        let history_json: Value = serde_json::from_str(&history.stdout).expect("history json");
+        assert_eq!(
+            history_json["history"].as_array().expect("entries").len(),
+            1
+        );
+        assert_eq!(
+            history_json["history"][0]["intent"],
+            "Apply parameter change"
+        );
+    }
+
+    #[test]
+    fn snapshot_create_list_and_restore_round_trip() {
+        let workspace_root = clone_workspace_fixture();
+        let create = run([
+            OsString::from("morphos"),
+            OsString::from("snapshot"),
+            OsString::from("create"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--name"),
+            OsString::from("Baseline"),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(create.exit_code, CliExitCode::Success);
+        let created: Value = serde_json::from_str(&create.stdout).expect("create json");
+        let snapshot_id = created["snapshot"]["id"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let request_path = write_transaction_file(
+            &workspace_root,
+            "mutate.json",
+            r#"{
+  "intent": "Mutate after snapshot",
+  "operations": [
+    {
+      "kind": "set_parameter_scalar",
+      "parameter_id": "arm_length",
+      "value": 5.1
+    }
+  ]
+}"#,
+        );
+        let apply = run([
+            OsString::from("morphos"),
+            OsString::from("tx"),
+            OsString::from("apply"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--file"),
+            request_path.into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(apply.exit_code, CliExitCode::Success);
+
+        let list = run([
+            OsString::from("morphos"),
+            OsString::from("snapshot"),
+            OsString::from("list"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(list.exit_code, CliExitCode::Success);
+        let listed: Value = serde_json::from_str(&list.stdout).expect("list json");
+        assert_eq!(listed["snapshots"].as_array().expect("snapshots").len(), 1);
+        assert_eq!(listed["snapshots"][0]["name"], "Baseline");
+
+        let restore = run([
+            OsString::from("morphos"),
+            OsString::from("snapshot"),
+            OsString::from("restore"),
+            workspace_root.clone().into_os_string(),
+            OsString::from("--id"),
+            OsString::from(snapshot_id),
+            OsString::from("--json"),
+        ]);
+        assert_eq!(restore.exit_code, CliExitCode::Success);
+        let restored = geom_scene::parse_scene(
+            &fs::read_to_string(workspace_root.join("source").join("scene.toml")).expect("source"),
+        )
+        .expect("scene");
+        assert_eq!(
+            restored.parameters()[&ParamId::new("arm_length").expect("param")].scalar_value(),
+            2.6
+        );
     }
 }
